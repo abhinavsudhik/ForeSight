@@ -1,0 +1,12 @@
+streamlit
+fastapi
+uvicorn
+pymupdf          # PDF parsing (imported as fitz)
+pdfplumber       # Text extraction
+paddleocr        # OCR
+paddlepaddle     # Required by PaddleOCR
+spacy            # NLP / entity extraction
+rapidfuzz        # Fuzzy name/address matching
+pillow           # Image handling
+plotly           # Financial analysis charts
+python-multipart
