@@ -10,19 +10,37 @@ Document → Fields:
   Valuation Report → property_id, valuation_amount, date, appraiser
   Bank Statement   → account_holder, account_number, monthly_credits, monthly_debits
 
-Extraction approach (two layers):
-  1. Regex first  — for structured fields like dates, ID numbers, amounts
-  2. spaCy NER    — for names and addresses (uses PERSON, GPE, ORG labels)
+Extraction approach (three layers — Gemini → Regex → spaCy NER):
+  1. Gemini LLM   — primary: sends raw OCR text to Gemini for intelligent
+                     structured extraction. Handles names without labels,
+                     Indian document formats, and ambiguous layouts.
+  2. Regex         — fallback: fills gaps with pattern-matched fields
+                     (dates, ID numbers, amounts, survey numbers, etc.)
+  3. spaCy NER     — final fallback: picks up remaining names (PERSON)
+                     and addresses (GPE, LOC) that regex missed.
 """
 
+import os
 import re
+import json
 import logging
 from dataclasses import dataclass, field
 from typing import Optional
 
 import spacy
+from google import genai
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Gemini configuration
+# ---------------------------------------------------------------------------
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
 # ---------------------------------------------------------------------------
 # Lazy-loaded spaCy model
@@ -468,12 +486,429 @@ def _extract_bank_statement(text: str) -> dict[str, Optional[str]]:
 # Dispatcher — maps document type to its extraction function
 # ---------------------------------------------------------------------------
 _EXTRACTORS: dict[str, callable] = {
+    # ── Original types (kept for backward compatibility) ──
     "identity_proof": _extract_identity_proof,
     "land_record": _extract_land_record,
     "sale_deed": _extract_sale_deed,
     "valuation_report": _extract_valuation_report,
     "bank_statement": _extract_bank_statement,
+
+    # ── Identity & Address Proofs (KYC) ──
+    "aadhaar_card": _extract_identity_proof,
+    "passport": _extract_identity_proof,
+    "voter_id": _extract_identity_proof,
+    "driving_licence": _extract_identity_proof,
+    "utility_bill": _extract_identity_proof,
+    "rent_agreement": _extract_identity_proof,
+
+    # ── Tax & Business Registrations ──
+    "pan_card": _extract_identity_proof,
+    "tan_certificate": _extract_identity_proof,
+    "gst_certificate": _extract_identity_proof,
+    "shop_establishment_licence": _extract_identity_proof,
+
+    # ── Income & Financial Proofs ──
+    "salary_slip": _extract_bank_statement,
+    "form_16": _extract_bank_statement,
+    "itr_filing": _extract_bank_statement,
+    "balance_sheet": _extract_bank_statement,
+    "profit_loss_statement": _extract_bank_statement,
+
+    # ── Property Ownership & Clearance Records ──
+    "title_deed": _extract_sale_deed,
+    "mutation_certificate": _extract_land_record,
+    "noc_certificate": _extract_identity_proof,
+    "encumbrance_certificate": _extract_land_record,
+
+    # ── Corporate Constitution Documents ──
+    "partnership_deed": _extract_identity_proof,
+    "trust_deed": _extract_identity_proof,
+    "memorandum_of_association": _extract_identity_proof,
+    "articles_of_association": _extract_identity_proof,
+
+    # ── Banking Instruments & Forms ──
+    "cheque": _extract_bank_statement,
+    "demand_draft": _extract_bank_statement,
+    "deposit_receipt": _extract_bank_statement,
+    "account_opening_form": _extract_bank_statement,
+    "loan_application_form": _extract_bank_statement,
+
+    # ── Authorizations & Mandates ──
+    "board_resolution": _extract_identity_proof,
+    "power_of_attorney": _extract_identity_proof,
+    "nach_ecs_mandate": _extract_bank_statement,
+
+    # ── Credit & Loan Agreements ──
+    "loan_agreement": _extract_sale_deed,
+    "hypothecation_deed": _extract_sale_deed,
+    "guarantee_letter": _extract_identity_proof,
 }
+
+
+# ---------------------------------------------------------------------------
+# Gemini LLM extraction — primary layer
+# ---------------------------------------------------------------------------
+
+# Schema of expected fields per document type (used in the Gemini prompt)
+_FIELD_SCHEMAS: dict[str, dict[str, str]] = {
+    # ── Original types ──
+    "identity_proof": {
+        "name": "Full name of the person on the ID document",
+        "dob": "Date of birth (in the format as it appears on the document)",
+        "address": "Full residential address",
+        "id_number": "ID number (Aadhaar / PAN / Passport number)",
+    },
+    "land_record": {
+        "owner_name": "Name of the property/land owner (pattadar/khatedar)",
+        "survey_number": "Survey number of the land",
+        "property_id": "Property ID or number",
+        "area": "Total area with unit (e.g. 5.5 acres, 2400 sq ft)",
+        "address": "Location / address of the property",
+    },
+    "sale_deed": {
+        "seller_name": "Name of the seller / vendor",
+        "buyer_name": "Name of the buyer / vendee / purchaser",
+        "property_id": "Property ID or number",
+        "date": "Date of the deed / registration",
+        "amount": "Sale consideration amount",
+    },
+    "valuation_report": {
+        "property_id": "Property ID or number",
+        "valuation_amount": "Valuation / assessed / fair market value amount",
+        "date": "Date of the valuation report",
+        "appraiser": "Name of the appraiser / valuer / assessor",
+    },
+    "bank_statement": {
+        "account_holder": "Name of the account holder / customer",
+        "account_number": "Bank account number",
+        "monthly_credits": "Total credits / deposits amount",
+        "monthly_debits": "Total debits / withdrawals amount",
+    },
+
+    # ── Identity & Address Proofs (KYC) ──
+    "aadhaar_card": {
+        "name": "Full name on the Aadhaar card",
+        "dob": "Date of birth",
+        "address": "Full residential address",
+        "id_number": "12-digit Aadhaar number",
+    },
+    "passport": {
+        "name": "Full name on the passport",
+        "dob": "Date of birth",
+        "address": "Address (if present)",
+        "id_number": "Passport number",
+    },
+    "voter_id": {
+        "name": "Full name on the voter ID",
+        "dob": "Date of birth or age",
+        "address": "Residential address",
+        "id_number": "EPIC / Voter ID number",
+    },
+    "driving_licence": {
+        "name": "Full name on the licence",
+        "dob": "Date of birth",
+        "address": "Residential address",
+        "id_number": "Driving licence number",
+    },
+    "utility_bill": {
+        "name": "Name of the consumer / account holder",
+        "address": "Service address on the bill",
+        "id_number": "Consumer / account number",
+        "dob": "Bill date or billing period",
+    },
+    "rent_agreement": {
+        "name": "Tenant name",
+        "address": "Rental property address",
+        "id_number": "Agreement registration number (if any)",
+        "dob": "Agreement start date",
+    },
+
+    # ── Tax & Business Registrations ──
+    "pan_card": {
+        "name": "Full name on the PAN card",
+        "dob": "Date of birth",
+        "address": "Address (if present)",
+        "id_number": "PAN number (10-character alphanumeric)",
+    },
+    "tan_certificate": {
+        "name": "Name of the deductor / entity",
+        "dob": "Date of issue",
+        "address": "Address of the entity",
+        "id_number": "TAN number",
+    },
+    "gst_certificate": {
+        "name": "Legal name of the business",
+        "dob": "Date of registration",
+        "address": "Principal place of business",
+        "id_number": "GSTIN number",
+    },
+    "shop_establishment_licence": {
+        "name": "Name of the establishment / owner",
+        "dob": "Date of issue / validity period",
+        "address": "Address of the establishment",
+        "id_number": "Licence / registration number",
+    },
+
+    # ── Income & Financial Proofs ──
+    "salary_slip": {
+        "account_holder": "Employee name",
+        "account_number": "Employee ID or PF number",
+        "monthly_credits": "Gross salary / net pay amount",
+        "monthly_debits": "Total deductions amount",
+    },
+    "form_16": {
+        "account_holder": "Employee name",
+        "account_number": "PAN of the employee",
+        "monthly_credits": "Total income / gross salary",
+        "monthly_debits": "Total tax deducted (TDS)",
+    },
+    "itr_filing": {
+        "account_holder": "Name of the assessee",
+        "account_number": "PAN number",
+        "monthly_credits": "Total income declared",
+        "monthly_debits": "Total tax payable / paid",
+    },
+    "balance_sheet": {
+        "account_holder": "Name of the company / entity",
+        "account_number": "CIN or registration number",
+        "monthly_credits": "Total assets",
+        "monthly_debits": "Total liabilities",
+    },
+    "profit_loss_statement": {
+        "account_holder": "Name of the company / entity",
+        "account_number": "CIN or registration number",
+        "monthly_credits": "Total revenue / income",
+        "monthly_debits": "Total expenses",
+    },
+
+    # ── Property Ownership & Clearance Records ──
+    "title_deed": {
+        "seller_name": "Previous owner / transferor",
+        "buyer_name": "Current owner / transferee",
+        "property_id": "Property ID / survey number",
+        "date": "Date of the deed",
+        "amount": "Consideration amount (if any)",
+    },
+    "mutation_certificate": {
+        "owner_name": "Name of the new owner (mutated in favour of)",
+        "survey_number": "Survey number / property number",
+        "property_id": "Khata number / property ID",
+        "area": "Area of the property",
+        "address": "Location / village / taluk",
+    },
+    "noc_certificate": {
+        "name": "Name of the applicant / property owner",
+        "dob": "Date of issue",
+        "address": "Property / project address",
+        "id_number": "NOC reference number",
+    },
+    "encumbrance_certificate": {
+        "owner_name": "Name of the property owner",
+        "survey_number": "Survey number",
+        "property_id": "Property ID / document number",
+        "area": "Period covered (from-to)",
+        "address": "Sub-registrar office / jurisdiction",
+    },
+
+    # ── Corporate Constitution Documents ──
+    "partnership_deed": {
+        "name": "Name of the partnership firm",
+        "dob": "Date of the deed / partnership commencement",
+        "address": "Registered office address",
+        "id_number": "Firm registration number",
+    },
+    "trust_deed": {
+        "name": "Name of the trust",
+        "dob": "Date of creation of the trust",
+        "address": "Registered address of the trust",
+        "id_number": "Trust registration number",
+    },
+    "memorandum_of_association": {
+        "name": "Name of the company",
+        "dob": "Date of incorporation",
+        "address": "Registered office address",
+        "id_number": "CIN / Company registration number",
+    },
+    "articles_of_association": {
+        "name": "Name of the company",
+        "dob": "Date of adoption",
+        "address": "Registered office address",
+        "id_number": "CIN / Company registration number",
+    },
+
+    # ── Banking Instruments & Forms ──
+    "cheque": {
+        "account_holder": "Name of the drawer / issuer",
+        "account_number": "Account number / cheque number",
+        "monthly_credits": "Amount on the cheque",
+        "monthly_debits": "N/A",
+    },
+    "demand_draft": {
+        "account_holder": "Name of the payee",
+        "account_number": "DD number",
+        "monthly_credits": "Amount of the DD",
+        "monthly_debits": "N/A",
+    },
+    "deposit_receipt": {
+        "account_holder": "Name of the depositor",
+        "account_number": "FD/RD account number",
+        "monthly_credits": "Deposit amount / maturity value",
+        "monthly_debits": "Interest rate",
+    },
+    "account_opening_form": {
+        "account_holder": "Name of the applicant",
+        "account_number": "Account number (if assigned)",
+        "monthly_credits": "Initial deposit amount",
+        "monthly_debits": "N/A",
+    },
+    "loan_application_form": {
+        "account_holder": "Name of the applicant / borrower",
+        "account_number": "Application / reference number",
+        "monthly_credits": "Loan amount requested",
+        "monthly_debits": "Proposed EMI amount",
+    },
+
+    # ── Authorizations & Mandates ──
+    "board_resolution": {
+        "name": "Name of the company",
+        "dob": "Date of the resolution",
+        "address": "Registered office address",
+        "id_number": "Resolution reference number",
+    },
+    "power_of_attorney": {
+        "name": "Name of the principal (grantor)",
+        "dob": "Date of execution",
+        "address": "Address of the principal",
+        "id_number": "PoA registration number",
+    },
+    "nach_ecs_mandate": {
+        "account_holder": "Name of the account holder",
+        "account_number": "Bank account number",
+        "monthly_credits": "Maximum amount authorised",
+        "monthly_debits": "UMRN / mandate reference number",
+    },
+
+    # ── Credit & Loan Agreements ──
+    "loan_agreement": {
+        "seller_name": "Name of the lender / bank",
+        "buyer_name": "Name of the borrower",
+        "property_id": "Loan account / reference number",
+        "date": "Date of the agreement",
+        "amount": "Loan amount / sanctioned amount",
+    },
+    "hypothecation_deed": {
+        "seller_name": "Name of the lender / financier",
+        "buyer_name": "Name of the borrower",
+        "property_id": "Asset / vehicle registration number",
+        "date": "Date of the deed",
+        "amount": "Loan / hypothecation amount",
+    },
+    "guarantee_letter": {
+        "name": "Name of the guarantor",
+        "dob": "Date of the guarantee",
+        "address": "Address of the guarantor",
+        "id_number": "Guarantee reference number",
+    },
+}
+
+
+def _gemini_extract_fields(
+    text: str, document_type: str
+) -> dict[str, Optional[str]]:
+    """
+    Use Gemini LLM to extract structured fields from raw OCR text.
+
+    This is the primary extraction method. It sends a text-only request
+    to Gemini with a document-type-aware prompt asking for JSON output.
+
+    Returns a dict of field_name → value (or None if not found).
+    Returns an empty dict if Gemini is unavailable or fails.
+    """
+    if not GEMINI_API_KEY:
+        logger.warning("GEMINI_API_KEY not set — skipping Gemini extraction")
+        return {}
+
+    schema = _FIELD_SCHEMAS.get(document_type)
+    if not schema:
+        logger.warning(
+            "No Gemini schema for document type '%s' — skipping", document_type
+        )
+        return {}
+
+    # Build a field description list for the prompt
+    field_descriptions = "\n".join(
+        f'  - "{key}": {desc}' for key, desc in schema.items()
+    )
+
+    prompt = f"""You are a precise document data extractor. You will be given raw OCR text from an Indian document classified as "{document_type.replace('_', ' ')}".
+
+Extract the following fields from the text:
+{field_descriptions}
+
+IMPORTANT RULES:
+1. Names may NOT have a label like "Name:" before them. Use context clues:
+   - On Aadhaar cards, the name appears near the top, above the DOB/Gender line.
+   - On PAN cards, the name is below "Permanent Account Number" and above "Father's Name".
+   - On bank passbooks, look for the name near "Account Holder", "Customer Name", or after honorifics like Mr./Mrs./Ms., or near S/o, D/o, W/o.
+   - On sale deeds, look for names after "hereinafter called the vendor/vendee" or "first party/second party".
+2. Return values EXACTLY as they appear in the text — do not correct spelling.
+3. For monetary amounts, include the number only (no currency symbols).
+4. If a field cannot be found, set its value to null.
+5. Return ONLY a valid JSON object with the field names as keys. No explanation, no markdown.
+
+RAW OCR TEXT:
+---
+{text[:4000]}
+---
+
+JSON output:"""
+
+    try:
+        logger.info("Calling Gemini for field extraction (%s) …", document_type)
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=[prompt],
+        )
+
+        raw_response = (response.text or "").strip()
+        logger.debug("Gemini raw response: %s", raw_response[:500])
+
+        # Strip markdown code fences if present
+        if raw_response.startswith("```"):
+            # Remove ```json ... ``` or ``` ... ```
+            lines = raw_response.split("\n")
+            # Drop first line (```json) and last line (```)
+            if lines[-1].strip() == "```":
+                lines = lines[1:-1]
+            else:
+                lines = lines[1:]
+            raw_response = "\n".join(lines).strip()
+
+        parsed = json.loads(raw_response)
+
+        # Normalise: ensure all expected keys exist, convert empty strings to None
+        result: dict[str, Optional[str]] = {}
+        for key in schema:
+            val = parsed.get(key)
+            if val is None or (isinstance(val, str) and not val.strip()):
+                result[key] = None
+            else:
+                result[key] = str(val).strip()
+
+        found_count = sum(1 for v in result.values() if v is not None)
+        logger.info(
+            "Gemini extracted %d/%d fields for '%s'",
+            found_count, len(schema), document_type,
+        )
+        return result
+
+    except json.JSONDecodeError as exc:
+        logger.warning("Gemini returned invalid JSON: %s", exc)
+        return {}
+    except Exception as exc:
+        logger.error("Gemini field extraction failed: %s", exc)
+        return {}
 
 
 # ---------------------------------------------------------------------------
@@ -507,15 +942,16 @@ def extract_fields(text: str, document_type: str) -> ExtractionResult:
     """
     Extract structured fields from raw document text.
 
-    Workflow
-    --------
-    1. Look up the extraction function for the given ``document_type``.
-    2. Run **Regex** patterns first to capture structured data
-       (dates, IDs, amounts, account numbers, survey numbers, etc.).
-    3. Run **spaCy NER** second to capture names (PERSON) and
-       addresses (GPE / LOC) that regex cannot reliably handle.
-    4. Return an ``ExtractionResult`` with the extracted fields and
-       diagnostic metadata.
+    Workflow (three layers — Gemini → Regex → spaCy NER)
+    -----------------------------------------------------
+    1. **Gemini LLM** (primary): Send the raw text to Gemini and ask it
+       to return a JSON object of extracted fields. This handles names
+       that appear without labels, Indian document formats, and complex
+       layouts that regex cannot parse.
+    2. **Regex + spaCy NER** (fallback): For any fields that Gemini
+       returned as ``null`` or if Gemini fails entirely, run the
+       existing regex patterns and NER pipeline to fill the gaps.
+    3. **Merge**: Gemini results take priority; regex/NER fills blanks.
 
     Parameters
     ----------
@@ -561,8 +997,30 @@ def extract_fields(text: str, document_type: str) -> ExtractionResult:
     extractor = _EXTRACTORS[document_type]
     logger.info("Extracting fields for document type '%s' …", document_type)
 
-    # --- Run the two-layer extraction ---
-    fields = extractor(text)
+    # --- Layer 1: Gemini LLM extraction (primary) ---
+    gemini_fields = _gemini_extract_fields(text, document_type)
+
+    # --- Layer 2+3: Regex + spaCy NER extraction (fallback) ---
+    regex_ner_fields = extractor(text)
+
+    # --- Merge: Gemini takes priority, regex/NER fills gaps ---
+    if gemini_fields:
+        fields = {}
+        for key in regex_ner_fields:
+            gemini_val = gemini_fields.get(key)
+            regex_val = regex_ner_fields.get(key)
+            # Prefer Gemini's value if available, else fall back to regex/NER
+            fields[key] = gemini_val if gemini_val is not None else regex_val
+        logger.info(
+            "Merged fields — Gemini provided %d, regex/NER filled %d gaps",
+            sum(1 for k in fields if gemini_fields.get(k) is not None),
+            sum(1 for k in fields
+                if gemini_fields.get(k) is None and regex_ner_fields.get(k) is not None),
+        )
+    else:
+        # Gemini failed entirely — use regex/NER only
+        fields = regex_ner_fields
+        logger.info("Gemini unavailable — using regex/NER extraction only")
 
     # --- Build diagnostics ---
     found = [k for k, v in fields.items() if v is not None]

@@ -357,6 +357,17 @@ def _run_pipeline(uploaded_files) -> dict:
                 }
         documents.append(doc_record)
 
+    try:
+        raw_text = extract_text(tmp_path)
+    except Exception as exc:
+        st.error(f"OCR ERROR: {exc}")
+        raw_text = ""
+
+    # ADD THIS TEMPORARILY
+    st.markdown(f"**Debug — {filename}**")
+    st.write(f"Characters extracted: {len(raw_text)}")
+    st.text_area("Raw text", raw_text[:2000], height=200)
+
     # ------------------------------------------------------------------
     # Phase 2 — Cross-document validation
     # ------------------------------------------------------------------
