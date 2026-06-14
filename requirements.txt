@@ -10,3 +10,7 @@ rapidfuzz        # Fuzzy name/address matching
 pillow           # Image handling
 plotly           # Financial analysis charts
 python-multipart
+scipy
+opencv-python-headless
+scikit-image
+numpy

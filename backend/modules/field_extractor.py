@@ -30,6 +30,7 @@ from typing import Optional
 import spacy
 from google import genai
 from dotenv import load_dotenv
+from backend.modules import gemini_client
 
 # Load environment variables from .env file
 load_dotenv()
@@ -39,7 +40,6 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Gemini configuration
 # ---------------------------------------------------------------------------
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
 # ---------------------------------------------------------------------------
@@ -186,6 +186,71 @@ def _find_first_date(text: str) -> Optional[str]:
         if result:
             return result
     return None
+
+
+def extract_issue_date_by_keywords(text: str) -> Optional[str]:
+    """
+    Search for date keywords in text and extract the corresponding date value.
+    Supports a list of synonymous keywords for the document's issue date.
+    """
+    if not text or not text.strip():
+        return None
+
+    keywords = [
+        "issue date",
+        "date of issue",
+        "issuance date",
+        "date of issuance",
+        "date of enrolment",
+        "registration date",
+        "date of sanction",
+        "date of approval",
+        "date of grant",
+        "date of execution",
+        "date of allotment",
+        "date of invoice",
+        "date of incorporation",
+        "date of declaration",
+        "result date",
+        "date of passing",
+        "deed date",
+        "date of deed",
+        "bill date",
+        "date of bill",
+        "agreement date",
+        "date of agreement",
+        "statement date",
+        "date of statement",
+        "dated"
+    ]
+
+    # Try line-by-line matching first for clean local extraction
+    for line in text.splitlines():
+        line_lower = line.lower()
+        for kw in keywords:
+            if kw in line_lower:
+                # Found the keyword! Extract the suffix after the keyword
+                idx = line_lower.find(kw)
+                suffix = line[idx + len(kw):].strip()
+                # Remove common separators like :, -, =, spaces
+                suffix = re.sub(r"^[:\-\s=]+", "", suffix).strip()
+                # Now try to find the first date pattern in this suffix
+                for pattern in _DATE_PATTERNS:
+                    match = re.search(pattern, suffix, re.IGNORECASE)
+                    if match:
+                        return match.group(1).strip()
+
+    # Fallback: search the whole text for a keyword followed closely by a date
+    for kw in keywords:
+        for pattern in _DATE_PATTERNS:
+            # Match keyword, followed by up to 30 characters of optional punctuation/spaces, followed by the date pattern
+            full_pattern = rf"(?i)\b{re.escape(kw)}\b[\s\S]{{0,30}}?({pattern})"
+            match = re.search(full_pattern, text)
+            if match:
+                return match.group(1).strip()
+
+    return None
+
 
 
 def _find_all_dates(text: str) -> list[str]:
@@ -811,6 +876,12 @@ _FIELD_SCHEMAS: dict[str, dict[str, str]] = {
     },
 }
 
+# Dynamically append "issue date" and "issue_date" to every document schema in _FIELD_SCHEMAS
+for _schema in _FIELD_SCHEMAS.values():
+    _schema["issue date"] = "The date the document was issued, registered, signed, declared, or approved"
+    _schema["issue_date"] = "The date the document was issued, registered, signed, declared, or approved (alias)"
+
+
 
 def _gemini_extract_fields(
     text: str, document_type: str
@@ -824,8 +895,8 @@ def _gemini_extract_fields(
     Returns a dict of field_name → value (or None if not found).
     Returns an empty dict if Gemini is unavailable or fails.
     """
-    if not GEMINI_API_KEY:
-        logger.warning("GEMINI_API_KEY not set — skipping Gemini extraction")
+    if not gemini_client.is_gemini_available():
+        logger.warning("Gemini API not configured — skipping Gemini extraction")
         return {}
 
     schema = _FIELD_SCHEMAS.get(document_type)
@@ -865,8 +936,7 @@ JSON output:"""
 
     try:
         logger.info("Calling Gemini for field extraction (%s) …", document_type)
-        client = genai.Client(api_key=GEMINI_API_KEY)
-        response = client.models.generate_content(
+        response = gemini_client.generate_content(
             model=GEMINI_MODEL,
             contents=[prompt],
         )
@@ -980,6 +1050,8 @@ def extract_fields(text: str, document_type: str) -> ExtractionResult:
             )
         extractor = _EXTRACTORS[document_type]
         empty_fields = extractor("")
+        empty_fields["issue date"] = None
+        empty_fields["issue_date"] = None
         return ExtractionResult(
             document_type=document_type,
             fields=empty_fields,
@@ -1002,6 +1074,11 @@ def extract_fields(text: str, document_type: str) -> ExtractionResult:
 
     # --- Layer 2+3: Regex + spaCy NER extraction (fallback) ---
     regex_ner_fields = extractor(text)
+    
+    # Populate the fallback/regex "issue date" and "issue_date" fields
+    issue_date_val = extract_issue_date_by_keywords(text)
+    regex_ner_fields["issue date"] = issue_date_val
+    regex_ner_fields["issue_date"] = issue_date_val
 
     # --- Merge: Gemini takes priority, regex/NER fills gaps ---
     if gemini_fields:

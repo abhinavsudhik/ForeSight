@@ -22,6 +22,7 @@ from PIL import Image
 import pdfplumber
 from google import genai
 from dotenv import load_dotenv
+from backend.modules import gemini_client
 
 # Load environment variables from .env file
 load_dotenv()
@@ -32,7 +33,6 @@ logger = logging.getLogger(__name__)
 # Configuration
 # ---------------------------------------------------------------------------
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
 _SUPPORTED_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".webp"}
@@ -73,20 +73,19 @@ def _ocr_single_image(img: Image.Image) -> str:
     """
     try:
         logger.info("Calling Gemini OCR API (%s) …", GEMINI_MODEL)
-        client = genai.Client(api_key=GEMINI_API_KEY)
         prompt = (
             "You are a precise document OCR reader. Transcribe all text from this image exactly as it appears. "
             "Do not add any preamble, metadata, or post-conversation remarks. "
             "Output only the extracted text."
         )
-        response = client.models.generate_content(
+        response = gemini_client.generate_content(
             model=GEMINI_MODEL,
             contents=[img, prompt]
         )
         return response.text or ""
     except Exception as exc:
         logger.error("Gemini OCR failed: %s", exc)
-        return ""
+        raise exc
 
 
 # ---------------------------------------------------------------------------

@@ -66,6 +66,7 @@ def calculate_trust_score(
     cross_doc_flags: list,
     metadata_flags: list,
     financial_flags: list,
+    tampering_flags: list,
 ) -> dict:
     """
     Calculate an overall trust score from all module flags.

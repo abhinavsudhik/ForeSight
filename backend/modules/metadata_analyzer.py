@@ -23,7 +23,7 @@ Creation and modification dates identical but suspiciously recent → Low
 import logging
 import os
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Optional, Union, Any
 
 import fitz  # PyMuPDF
 
@@ -155,7 +155,7 @@ def _is_generic_author(author: str) -> bool:
 
 def analyze_metadata(
     pdf_path: str,
-    document_issue_date: Optional[str] = None,
+    document_issue_date: Optional[Union[str, dict]] = None,
 ) -> dict:
     """
     Extract PDF metadata and flag suspicious patterns.
@@ -242,18 +242,29 @@ def analyze_metadata(
     if modification_dt and document_issue_date:
         # Parse the document issue date
         issue_dt = _parse_document_date(document_issue_date)
+        
+        display_issue_date = document_issue_date
+        if isinstance(document_issue_date, dict):
+            display_issue_date = (
+                document_issue_date.get("issue date")
+                or document_issue_date.get("issue_date")
+                or document_issue_date.get("date")
+                or document_issue_date.get("dob")
+                or "Unknown"
+            )
+
         if issue_dt and modification_dt > issue_dt:
             flags.append({
                 "check": "metadata_analysis",
                 "severity": "high",
                 "message": (
                     f"PDF was modified ({metadata['modification_date']}) after "
-                    f"the document's issue date ({document_issue_date}) — "
+                    f"the document's issue date ({display_issue_date}) — "
                     f"possible post-issuance tampering"
                 ),
                 "evidence": {
                     "modification_date": metadata["modification_date"],
-                    "document_issue_date": document_issue_date,
+                    "document_issue_date": display_issue_date,
                     "days_after": (modification_dt - issue_dt).days,
                 },
             })
@@ -334,12 +345,25 @@ def analyze_metadata(
 # Internal date parser for document issue dates
 # ---------------------------------------------------------------------------
 
-def _parse_document_date(date_str: str) -> Optional[datetime]:
+def _parse_document_date(date_val: Union[str, dict, None]) -> Optional[datetime]:
     """
-    Parse a date string from the field extractor into a datetime.
+    Parse a date string or dictionary containing issue date from the field extractor into a datetime.
     Supports common Indian and international date formats.
     """
-    if not date_str:
+    if not date_val:
+        return None
+
+    if isinstance(date_val, dict):
+        date_str = (
+            date_val.get("issue date")
+            or date_val.get("issue_date")
+            or date_val.get("date")
+            or date_val.get("dob")
+        )
+    else:
+        date_str = date_val
+
+    if not date_str or not isinstance(date_str, str):
         return None
 
     date_str = date_str.strip()

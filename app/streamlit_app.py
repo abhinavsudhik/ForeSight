@@ -20,15 +20,21 @@ import tempfile
 import logging
 from datetime import datetime
 
-import streamlit as st
-import plotly.graph_objects as go
-
 # ---------------------------------------------------------------------------
-# Ensure the project root is on sys.path so backend modules can be imported
+# Ensure the project root is on sys.path so backend modules can be imported.
+# This MUST come before any `from backend.*` import.
 # ---------------------------------------------------------------------------
 _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
+
+import streamlit as st
+import plotly.graph_objects as go
+
+from backend.modules.tamper_detector import (
+    detect_tampering,
+    detect_tampering_from_pdf_page,
+)
 
 from backend.modules.ocr_engine import extract_text
 from backend.modules.document_classifier import classify_document
@@ -271,7 +277,7 @@ def _run_pipeline(uploaded_files) -> dict:
     all_metadata_results: list[dict] = []
     financial_result: dict | None = None
 
-    total_steps = len(uploaded_files) * 3 + 4  # OCR+Classify+Extract per file, + cross/meta/fin/score
+    total_steps = len(uploaded_files) * 3 + 5  # OCR+Classify+Extract per file, + cross/meta/tamper/fin/score
     current_step = 0
     progress = st.progress(0, text="Starting analysis…")
 
@@ -389,9 +395,8 @@ def _run_pipeline(uploaded_files) -> dict:
     all_metadata_flags: list[dict] = []
     for doc in documents:
         if doc["tmp_path"].lower().endswith(".pdf"):
-            # Try to get the document's issue date for comparison
-            issue_date = doc["fields"].get("date") or doc["fields"].get("dob")
-            meta_result = analyze_metadata(doc["tmp_path"], issue_date)
+            # Pass the fields dictionary to let the analyzer fetch the issue date
+            meta_result = analyze_metadata(doc["tmp_path"], doc["fields"])
             all_metadata_results.append({
                 "filename": doc["filename"],
                 "metadata": meta_result["metadata"],
@@ -399,6 +404,29 @@ def _run_pipeline(uploaded_files) -> dict:
                 "summary": meta_result["summary"],
             })
             all_metadata_flags.extend(meta_result["flags"])
+
+    
+    # Phase 3b — Visual tampering analysis (per document)
+    current_step += 1
+    progress.progress(
+        current_step / total_steps,
+        text="🔬 Running visual tampering analysis…",
+    )
+    all_tampering_results = []
+    for doc in documents:
+        path = doc["tmp_path"]
+        ext = os.path.splitext(path)[1].lower()
+        try:
+            if ext == ".pdf":
+                tamper_result = detect_tampering_from_pdf_page(path)
+            else:
+                tamper_result = detect_tampering(path)
+            all_tampering_results.append({
+                "filename": doc["filename"],
+                "result": tamper_result,
+            })
+        except Exception as exc:
+            logger.warning("Tampering analysis failed for %s: %s", doc["filename"], exc)
 
     # ------------------------------------------------------------------
     # Phase 4 — Financial anomaly detection (bank statement only)
@@ -422,14 +450,21 @@ def _run_pipeline(uploaded_files) -> dict:
     # Phase 5 — Trust score & recommendation
     # ------------------------------------------------------------------
     current_step += 1
+
+    tampering_flags = []
+    for tr in all_tampering_results:
+        tampering_flags.extend(tr["result"].get("flags", []))
+
     progress.progress(
         current_step / total_steps,
         text="⚖️ Calculating trust score…",
     )
+    
     score_result = calculate_trust_score(
         cross_doc_flags=cross_doc_flags,
         metadata_flags=all_metadata_flags,
         financial_flags=financial_flags,
+        tampering_flags=tampering_flags,
     )
     recommendation = generate_recommendation(score_result)
 
@@ -443,6 +478,7 @@ def _run_pipeline(uploaded_files) -> dict:
         "financial_result": financial_result,
         "score_result": score_result,
         "recommendation": recommendation,
+        "tampering_results": all_tampering_results,
     }
 
 
@@ -597,6 +633,70 @@ def _render_tab_extracted_data(results: dict):
         else:
             st.caption(f"✅ All {total} fields extracted successfully")
 
+        st.divider()
+
+
+def _render_tab_tampering(results: dict):
+    tampering_results = results.get("tampering_results", [])
+    
+    if not tampering_results:
+        st.info("No tampering analysis results available.")
+        return
+    
+    for item in tampering_results:
+        filename = item["filename"]
+        result = item["result"]
+        risk_level = result.get("risk_level", "unknown")
+        
+        risk_colors = {
+            "clean": "#52c41a",
+            "low_suspicion": "#faad14",
+            "suspicious": "#ff7a00",
+            "high_risk": "#ff4d4f",
+            "unknown": "#8892b0",
+        }
+        color = risk_colors.get(risk_level, "#8892b0")
+        
+        st.markdown(f"### 🔬 {filename}")
+        st.markdown(
+            f"**Overall Assessment:** "
+            f"<span style='color:{color}; font-weight:700;'>"
+            f"{risk_level.replace('_', ' ').title()}</span>",
+            unsafe_allow_html=True,
+        )
+        st.caption(result.get("summary", ""))
+        
+        checks = result.get("checks", [])
+        if not checks:
+            st.warning("No check results available.")
+            continue
+        
+        # Render each check's heatmap in a grid
+        cols = st.columns(min(len(checks), 3))
+        for i, check in enumerate(checks):
+            col = cols[i % 3]
+            with col:
+                st.markdown(f"**{check['label']}**")
+                heatmap = check.get("heatmap_b64")
+                if heatmap:
+                    st.image(
+                        f"data:image/png;base64,{heatmap}",
+                        width=300,
+                    )
+                else:
+                    st.caption("No heatmap available.")
+                st.caption(check.get("description", ""))
+                
+                flags = check.get("flags", [])
+                for flag in flags:
+                    sev = flag.get("severity", "low")
+                    if sev == "high":
+                        st.error(f"🔴 {flag['message']}")
+                    elif sev == "medium":
+                        st.warning(f"🟡 {flag['message']}")
+                    else:
+                        st.info(f"🟢 {flag['message']}")
+        
         st.divider()
 
 
@@ -980,11 +1080,12 @@ if "results" not in st.session_state:
 # ── Render the 6 tabs ──
 results = st.session_state["results"]
 
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6 , tab7 = st.tabs([
     "📊 Case Overview",
     "📋 Extracted Data",
     "🔗 Cross-Doc Flags",
     "🔒 Metadata",
+    "🔬 Tampering",
     "💰 Financial",
     "✅ Recommendation",
 ])
@@ -1006,3 +1107,6 @@ with tab5:
 
 with tab6:
     _render_tab_recommendation(results)
+
+with tab7:
+    _render_tab_tampering(results)

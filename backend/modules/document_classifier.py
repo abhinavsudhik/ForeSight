@@ -14,6 +14,7 @@ from dataclasses import dataclass
 
 from google import genai
 from dotenv import load_dotenv
+from backend.modules import gemini_client
 
 # Load environment variables from .env file
 load_dotenv()
@@ -23,7 +24,6 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Gemini configuration
 # ---------------------------------------------------------------------------
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
 # ---------------------------------------------------------------------------
@@ -283,8 +283,8 @@ def _gemini_classify(text: str) -> ClassificationResult | None:
 
     Returns a ClassificationResult on success, or None if Gemini fails.
     """
-    if not GEMINI_API_KEY:
-        logger.warning("GEMINI_API_KEY not set — skipping Gemini classification")
+    if not gemini_client.is_gemini_available():
+        logger.warning("Gemini API not configured — skipping Gemini classification")
         return None
 
     # Build the document type list for the prompt
@@ -320,8 +320,7 @@ JSON output:"""
 
     try:
         logger.info("Calling Gemini for document classification …")
-        client = genai.Client(api_key=GEMINI_API_KEY)
-        response = client.models.generate_content(
+        response = gemini_client.generate_content(
             model=GEMINI_MODEL,
             contents=[prompt],
         )
