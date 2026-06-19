@@ -1,35 +1,30 @@
 """
 Document Classifier module for ForeSight.
-Takes extracted text and returns a document-type label using Google Gemini LLM.
+Takes extracted text and returns a document-type label using a local
+CrossEncoder NLI model (zero-shot classification, fully offline).
 
-Primary strategy: Send the OCR text to Gemini and ask it to pick the closest
-document type from a predefined list.
-Fallback strategy: If Gemini is unavailable, use keyword-based scoring.
+Primary strategy: Run zero-shot NLI classification via
+cross-encoder/nli-MiniLM2-L6-H768.
+Fallback strategy: If the model is unavailable, use keyword-based scoring.
 """
 
 import os
-import json
+# Force offline mode for HuggingFace hub
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
 import logging
 from dataclasses import dataclass
+from typing import Optional
 
-from google import genai
-from dotenv import load_dotenv
-from backend.modules import gemini_client
-
-# Load environment variables from .env file
-load_dotenv()
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Gemini configuration
-# ---------------------------------------------------------------------------
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-
-# ---------------------------------------------------------------------------
 # Document type registry — comprehensive list of Indian document types
 # ---------------------------------------------------------------------------
-# Maps internal label → human-readable description (used in the Gemini prompt)
+# Maps internal label → human-readable description (used for NLI candidate pairs)
 DOCUMENT_TYPES: dict[str, str] = {
     # ── Identity & Address Proofs (KYC) ──
     "aadhaar_card": "Aadhaar Card — UIDAI-issued 12-digit unique identity card",
@@ -88,7 +83,7 @@ _DEFAULT_LABEL = "unknown"
 
 
 # ---------------------------------------------------------------------------
-# Keyword fallback dictionary (trimmed version for when Gemini is unavailable)
+# Keyword fallback dictionary (trimmed version for when model is unavailable)
 # ---------------------------------------------------------------------------
 KEYWORDS: dict[str, list[str]] = {
     "bank_statement": [
@@ -264,108 +259,93 @@ class ClassificationResult:
     """Best-matching document type (e.g. ``'sale_deed'``)."""
 
     confidence: float
-    """Confidence score (0.0–1.0). From Gemini or keyword ratio."""
+    """Confidence score (0.0–1.0). From NLI model or keyword ratio."""
 
     scores: dict[str, int]
-    """Raw keyword-hit counts for every category (empty when Gemini is used)."""
+    """Raw keyword-hit counts for every category (empty when model is used)."""
 
 
 # ---------------------------------------------------------------------------
-# Gemini-powered classification
+# Lazy-loaded CrossEncoder NLI model
+# ---------------------------------------------------------------------------
+_nli_model = None
+
+
+def _get_nli_model():
+    """Load the CrossEncoder NLI model on first call and cache it."""
+    global _nli_model
+    if _nli_model is None:
+        from sentence_transformers import CrossEncoder
+        logger.info("Loading CrossEncoder NLI model (cross-encoder/nli-MiniLM2-L6-H768) …")
+        _nli_model = CrossEncoder("cross-encoder/nli-MiniLM2-L6-H768")
+        logger.info("CrossEncoder NLI model loaded successfully.")
+    return _nli_model
+
+
+# ---------------------------------------------------------------------------
+# NLI-powered classification
 # ---------------------------------------------------------------------------
 
-def _gemini_classify(text: str) -> ClassificationResult | None:
+def _nli_classify(text: str) -> Optional[ClassificationResult]:
     """
-    Use Gemini LLM to classify the document text.
+    Use a CrossEncoder NLI model for zero-shot document classification.
 
-    Sends the first ~4000 characters of extracted text to Gemini along with
-    the full list of document types, and asks it to pick the best match.
+    Builds (text_snippet, label_description) pairs for every document type,
+    predicts entailment scores, and picks the highest-scoring label.
 
-    Returns a ClassificationResult on success, or None if Gemini fails.
+    Returns a ClassificationResult on success, or None if the model fails.
     """
-    if not gemini_client.is_gemini_available():
-        logger.warning("Gemini API not configured — skipping Gemini classification")
+    try:
+        model = _get_nli_model()
+    except Exception as exc:
+        logger.error("Failed to load NLI model: %s", exc)
         return None
 
-    # Build the document type list for the prompt
-    type_list = "\n".join(
-        f'  - "{key}": {desc}' for key, desc in DOCUMENT_TYPES.items()
-    )
-
-    prompt = f"""You are a document classification expert specializing in Indian financial, legal, and identity documents.
-
-You will be given raw OCR text extracted from a scanned document. Your job is to classify it into exactly ONE of the following document types.
-
-AVAILABLE DOCUMENT TYPES:
-{type_list}
-
-CLASSIFICATION RULES:
-1. Read the OCR text carefully — look for headers, titles, logos, form numbers, legal language, and structural cues.
-2. Pick the SINGLE best-matching document type from the list above.
-3. If the document clearly doesn't match ANY type, use "unknown".
-4. Assign a confidence score between 0.0 and 1.0 based on how certain you are.
-5. Return ONLY a valid JSON object with exactly two keys: "label" and "confidence". No explanation, no markdown.
-
-EXAMPLES:
-  - Text mentioning "Unique Identification Authority of India" → {{"label": "aadhaar_card", "confidence": 0.95}}
-  - Text with "Sale Deed", "vendor", "vendee", "stamp duty" → {{"label": "sale_deed", "confidence": 0.92}}
-  - Text with salary breakdown, basic pay, HRA, deductions → {{"label": "salary_slip", "confidence": 0.88}}
-
-RAW OCR TEXT:
----
-{text[:4000]}
----
-
-JSON output:"""
-
     try:
-        logger.info("Calling Gemini for document classification …")
-        response = gemini_client.generate_content(
-            model=GEMINI_MODEL,
-            contents=[prompt],
-        )
+        labels = list(DOCUMENT_TYPES.keys())
+        descriptions = list(DOCUMENT_TYPES.values())
 
-        raw_response = (response.text or "").strip()
-        logger.debug("Gemini classification raw response: %s", raw_response[:300])
+        # Truncate text to first 1000 chars for efficiency
+        text_snippet = text[:1000]
 
-        # Strip markdown code fences if present
-        if raw_response.startswith("```"):
-            lines = raw_response.split("\n")
-            if lines[-1].strip() == "```":
-                lines = lines[1:-1]
-            else:
-                lines = lines[1:]
-            raw_response = "\n".join(lines).strip()
+        # Build candidate pairs
+        pairs = [(text_snippet, desc) for desc in descriptions]
 
-        parsed = json.loads(raw_response)
-        label = parsed.get("label", _DEFAULT_LABEL)
-        confidence = float(parsed.get("confidence", 0.0))
+        # Predict entailment scores
+        scores = model.predict(pairs)
+        scores = np.array(scores)
 
-        # Validate the label is in our known types
-        if label != _DEFAULT_LABEL and label not in DOCUMENT_TYPES:
-            logger.warning(
-                "Gemini returned unknown label '%s' — mapping to '%s'",
-                label, _DEFAULT_LABEL,
-            )
-            label = _DEFAULT_LABEL
-            confidence = 0.0
+        # Ensure scores is 2D
+        if scores.ndim == 1:
+            scores = np.expand_dims(scores, axis=0)
+
+        # Extract entailment class scores (index 2)
+        entailment_scores = scores[:, 2]
+
+        # Pick the best label
+        best_idx = int(np.argmax(entailment_scores))
+        best_label = labels[best_idx]
+
+        # Compute confidence: softmax of top score vs second-best
+        sorted_scores = np.sort(entailment_scores)[::-1]
+        top_two = sorted_scores[:2]
+        exp_scores = np.exp(top_two - np.max(top_two))  # numerical stability
+        softmax_probs = exp_scores / exp_scores.sum()
+        confidence = float(softmax_probs[0])  # probability of top choice
 
         logger.info(
-            "Gemini classified as '%s' (confidence %.0f%%)",
-            label, confidence * 100,
+            "NLI classified as '%s' (confidence %.0f%%)",
+            best_label, confidence * 100,
         )
 
         return ClassificationResult(
-            label=label,
+            label=best_label,
             confidence=round(confidence, 4),
-            scores={},  # No keyword scores when using Gemini
+            scores={},  # No keyword scores when using NLI model
         )
 
-    except json.JSONDecodeError as exc:
-        logger.warning("Gemini returned invalid JSON: %s", exc)
-        return None
     except Exception as exc:
-        logger.error("Gemini classification failed: %s", exc)
+        logger.error("NLI classification failed: %s", exc)
         return None
 
 
@@ -375,7 +355,7 @@ JSON output:"""
 
 def _keyword_classify(text: str) -> ClassificationResult:
     """
-    Classify a document using keyword matching (fallback when Gemini is
+    Classify a document using keyword matching (fallback when the NLI model is
     unavailable). Scores each category by counting keyword hits.
     """
     text_lower = text.lower()
@@ -421,9 +401,9 @@ def classify_document(text: str) -> ClassificationResult:
     Workflow
     --------
     1. If the text is empty, return ``'unknown'`` immediately.
-    2. **Primary — Gemini LLM**: Send the text to Gemini and ask it to pick
-       the closest document type from the predefined list.
-    3. **Fallback — Keywords**: If Gemini is unavailable or fails, fall back
+    2. **Primary — NLI Model**: Run zero-shot classification via the
+       CrossEncoder NLI model.
+    3. **Fallback — Keywords**: If the model is unavailable or fails, fall back
        to keyword-based scoring across all categories.
 
     Parameters
@@ -435,7 +415,7 @@ def classify_document(text: str) -> ClassificationResult:
     -------
     ClassificationResult
         A dataclass containing the predicted label, a confidence score,
-        and the raw per-category keyword-hit counts (empty if Gemini was used).
+        and the raw per-category keyword-hit counts (empty if model was used).
     """
     if not text or not text.strip():
         logger.warning("Empty text received — returning '%s'", _DEFAULT_LABEL)
@@ -445,10 +425,10 @@ def classify_document(text: str) -> ClassificationResult:
             scores={},
         )
 
-    # --- Primary: Gemini classification ---
-    gemini_result = _gemini_classify(text)
-    if gemini_result is not None:
-        return gemini_result
+    # --- Primary: NLI classification ---
+    nli_result = _nli_classify(text)
+    if nli_result is not None:
+        return nli_result
 
     # --- Fallback: keyword classification ---
     logger.info("Falling back to keyword-based classification")

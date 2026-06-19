@@ -12,9 +12,16 @@ Six tabs:
   5. Financial Analysis   — Plotly credit/debit charts with anomaly markers
   6. Recommendation       — decision card + evidence cards
 """
-
 import os
 import sys
+
+# ---------------------------------------------------------------------------
+# Force HuggingFace libraries and tokenizers to run in offline mode.
+# This prevents network calls to huggingface.co for already downloaded models.
+# ---------------------------------------------------------------------------
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
 import uuid
 import tempfile
 import logging
@@ -36,7 +43,7 @@ from backend.modules.tamper_detector import (
     detect_tampering_from_pdf_page,
 )
 
-from backend.modules.ocr_engine import extract_text
+from backend.modules.ocr_engine import extract_text, OCRResult
 from backend.modules.document_classifier import classify_document
 from backend.modules.field_extractor import extract_fields
 from backend.modules.cross_document_engine import cross_validate
@@ -63,110 +70,184 @@ st.set_page_config(
 st.markdown("""
 <style>
 /* ── Global ────────────────────────────────────────────────────────────── */
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+
+:root {
+    --bg-primary:    #0d1117;
+    --bg-secondary:  #161b22;
+    --bg-surface:    #1c2128;
+    --border:        rgba(0, 229, 255, 0.08);
+    --border-hover:  rgba(0, 229, 255, 0.18);
+    --text-primary:  #e6edf3;
+    --text-secondary:#8b949e;
+    --accent-cyan:   #00e5ff;
+    --accent-blue:   #58a6ff;
+    --alert-red:     #dc3545;
+    --alert-yellow:  #faad14;
+    --alert-green:   #3fb950;
+}
 
 html, body, [class*="st-"] {
-    font-family: 'Inter', sans-serif;
+    font-family: 'Inter', -apple-system, sans-serif;
+}
+
+/* Restore icon font family for Material Symbols/Icons —
+   The [class*="st-"] rule above overrides the font on ALL Streamlit elements,
+   including icon spans that render Material Symbols ligatures
+   (e.g. "double_arrow_right", "arrow_right"). We must restore
+   the icon font on every element Streamlit uses to display icons. */
+[class*="material-symbols-"],
+[class*="material-icons-"],
+.material-icons,
+.material-symbols-outlined,
+.material-symbols-rounded,
+.material-symbols-sharp,
+/* Streamlit icon elements (wildcard to cover version differences) */
+[data-testid*="Icon"] *,
+[data-testid*="icon"] *,
+[data-testid*="Icon"],
+[data-testid*="icon"],
+[data-testid*="Collapse"] *,
+[data-testid*="collapse"] *,
+[data-testid="stExpanderToggleIcon"],
+[data-testid="stExpanderToggleIcon"] *,
+[data-testid="collapsedControl"] *,
+[data-testid="stSidebarCollapseButton"] *,
+[data-testid="stSidebarCollapsedControl"] *,
+[data-testid="baseButton-headerNoPadding"] *,
+button[kind="headerNoPadding"] *,
+/* Catch-all: any span inside a Streamlit button in the header area */
+header[data-testid="stHeader"] span,
+header[data-testid="stHeader"] button span {
+    font-family: 'Material Symbols Rounded', 'Material Symbols Outlined', 'Material Icons', sans-serif !important;
+    font-style: normal !important;
+    -webkit-font-feature-settings: 'liga' !important;
+    font-feature-settings: 'liga' !important;
+    -webkit-font-smoothing: antialiased !important;
+}
+
+/* Hide Streamlit branding and default header controls but keep sidebar collapsed control visible */
+#MainMenu, footer {
+    visibility: hidden;
+}
+.stAppDeployButton {
+    visibility: hidden;
+}
+[data-testid="stDecoration"] {
+    display: none;
+}
+header[data-testid="stHeader"] {
+    background: transparent !important;
 }
 
 /* ── Sidebar ───────────────────────────────────────────────────────────── */
 section[data-testid="stSidebar"] {
-    background: linear-gradient(180deg, #0f0f1a 0%, #1a1a2e 100%);
+    background: var(--bg-primary);
+    border-right: 1px solid var(--border);
 }
 section[data-testid="stSidebar"] * {
-    color: #e0e0e0 !important;
+    color: var(--text-primary) !important;
 }
 
 /* ── Score card ─────────────────────────────────────────────────────────── */
 .score-card {
-    background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-    border-radius: 16px;
-    padding: 2rem;
+    background: var(--bg-secondary);
+    border-radius: 8px;
+    padding: 1.75rem;
     text-align: center;
-    border: 1px solid rgba(255,255,255,0.06);
-    box-shadow: 0 8px 32px rgba(0,0,0,0.25);
+    border: 1px solid var(--border);
+    transition: border-color 0.2s ease;
+}
+.score-card:hover {
+    border-color: var(--border-hover);
 }
 .score-number {
-    font-size: 4rem;
-    font-weight: 800;
+    font-size: 3.5rem;
+    font-weight: 700;
     line-height: 1.1;
+    font-family: 'JetBrains Mono', monospace;
 }
 .score-label {
-    font-size: 0.9rem;
-    color: #8892b0;
+    font-size: 0.75rem;
+    color: var(--text-secondary);
     text-transform: uppercase;
-    letter-spacing: 2px;
-    margin-top: 0.25rem;
+    letter-spacing: 2.5px;
+    margin-top: 0.5rem;
+    font-weight: 500;
 }
 
 /* ── Risk badge ─────────────────────────────────────────────────────────── */
 .risk-badge {
     display: inline-block;
-    padding: 0.4rem 1.2rem;
-    border-radius: 999px;
-    font-weight: 700;
-    font-size: 1rem;
-    letter-spacing: 1px;
+    padding: 0.35rem 1rem;
+    border-radius: 4px;
+    font-weight: 600;
+    font-size: 0.85rem;
+    letter-spacing: 1.5px;
     text-transform: uppercase;
+    font-family: 'JetBrains Mono', monospace;
 }
 
 /* ── Info card ──────────────────────────────────────────────────────────── */
 .info-card {
-    background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-    border-radius: 12px;
-    padding: 1.25rem 1.5rem;
-    border: 1px solid rgba(255,255,255,0.06);
-    box-shadow: 0 4px 16px rgba(0,0,0,0.15);
+    background: var(--bg-secondary);
+    border-radius: 6px;
+    padding: 1rem 1.25rem;
+    border: 1px solid var(--border);
     margin-bottom: 0.75rem;
+    transition: border-color 0.2s ease;
+}
+.info-card:hover {
+    border-color: var(--border-hover);
 }
 .info-card h4 {
     margin: 0 0 0.25rem 0;
-    color: #8892b0;
-    font-size: 0.75rem;
+    color: var(--text-secondary);
+    font-size: 0.65rem;
     text-transform: uppercase;
-    letter-spacing: 1.5px;
-    font-weight: 600;
+    letter-spacing: 2px;
+    font-weight: 500;
 }
 .info-card p {
     margin: 0;
-    font-size: 1.35rem;
+    font-size: 1.15rem;
     font-weight: 600;
-    color: #ccd6f6;
+    color: var(--text-primary);
 }
 
 /* ── Severity dot ──────────────────────────────────────────────────────── */
 .severity-dot {
     display: inline-block;
-    width: 10px;
-    height: 10px;
+    width: 8px;
+    height: 8px;
     border-radius: 50%;
     margin-right: 6px;
 }
-.severity-high   { background: #ff4d4f; box-shadow: 0 0 6px #ff4d4f88; }
-.severity-medium { background: #faad14; box-shadow: 0 0 6px #faad1488; }
-.severity-low    { background: #52c41a; box-shadow: 0 0 6px #52c41a88; }
+.severity-high   { background: var(--alert-red);    box-shadow: 0 0 6px rgba(220,53,69,0.4); }
+.severity-medium { background: var(--alert-yellow); box-shadow: 0 0 6px rgba(250,173,20,0.4); }
+.severity-low    { background: var(--alert-green);   box-shadow: 0 0 6px rgba(63,185,80,0.4); }
 
 /* ── Flag counter badges ───────────────────────────────────────────────── */
 .flag-counts {
     display: flex;
-    gap: 1rem;
+    gap: 0.75rem;
     justify-content: center;
     margin-top: 1rem;
 }
 .flag-badge {
-    padding: 0.4rem 1rem;
-    border-radius: 8px;
+    padding: 0.35rem 0.75rem;
+    border-radius: 4px;
     font-weight: 600;
-    font-size: 0.95rem;
+    font-size: 0.85rem;
+    font-family: 'JetBrains Mono', monospace;
 }
 
 /* ── Decision card ─────────────────────────────────────────────────────── */
 .decision-card {
-    background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-    border-radius: 16px;
-    padding: 2rem;
-    border: 1px solid rgba(255,255,255,0.06);
-    box-shadow: 0 8px 32px rgba(0,0,0,0.25);
+    background: var(--bg-secondary);
+    border-radius: 8px;
+    padding: 1.75rem;
+    border: 1px solid var(--border);
     margin-bottom: 1.5rem;
 }
 
@@ -177,30 +258,79 @@ section[data-testid="stSidebar"] * {
 }
 .meta-table td {
     padding: 0.5rem 1rem;
-    border-bottom: 1px solid rgba(255,255,255,0.06);
+    border-bottom: 1px solid var(--border);
+    font-size: 0.9rem;
 }
 .meta-table td:first-child {
-    color: #8892b0;
+    color: var(--text-secondary);
     font-weight: 500;
     width: 40%;
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+.meta-table td:last-child {
+    color: var(--text-primary);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.85rem;
 }
 
 /* ── Hero header ───────────────────────────────────────────────────────── */
 .hero-header {
     text-align: center;
-    padding: 2rem 0 1rem 0;
+    padding: 3rem 0 1.5rem 0;
 }
 .hero-header h1 {
-    font-size: 2.5rem;
-    font-weight: 800;
-    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
-    margin-bottom: 0.25rem;
+    font-size: 2.25rem;
+    font-weight: 700;
+    color: var(--accent-cyan);
+    margin-bottom: 0.5rem;
+    letter-spacing: -0.5px;
 }
 .hero-header p {
-    color: #8892b0;
-    font-size: 1.05rem;
+    color: var(--text-secondary);
+    font-size: 0.95rem;
+    font-weight: 400;
+}
+
+/* ── Streamlit overrides for minimalism ────────────────────────────────── */
+.stTabs [data-baseweb="tab-list"] {
+    gap: 0;
+    border-bottom: 1px solid var(--border);
+}
+.stTabs [data-baseweb="tab"] {
+    padding: 0.6rem 1.2rem;
+    font-size: 0.8rem;
+    font-weight: 500;
+    letter-spacing: 0.5px;
+    color: var(--text-secondary);
+    border-bottom: 2px solid transparent;
+    transition: all 0.2s ease;
+}
+.stTabs [aria-selected="true"] {
+    color: var(--accent-cyan) !important;
+    border-bottom-color: var(--accent-cyan) !important;
+}
+.stExpander {
+    border: 1px solid var(--border) !important;
+    border-radius: 6px !important;
+    background: var(--bg-secondary) !important;
+}
+div[data-testid="stMetric"] {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.75rem 1rem;
+}
+div[data-testid="stMetric"] label {
+    color: var(--text-secondary) !important;
+    font-size: 0.7rem !important;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+}
+div[data-testid="stMetric"] [data-testid="stMetricValue"] {
+    font-family: 'JetBrains Mono', monospace !important;
+    color: var(--accent-cyan) !important;
 }
 </style>
 """, unsafe_allow_html=True)
@@ -220,10 +350,10 @@ def _generate_case_id() -> str:
 def _severity_color(severity: str) -> str:
     """Map severity string to a CSS colour."""
     return {
-        "high": "#ff4d4f",
+        "high": "#dc3545",
         "medium": "#faad14",
-        "low": "#52c41a",
-    }.get(severity.lower(), "#8892b0")
+        "low": "#3fb950",
+    }.get(severity.lower(), "#8b949e")
 
 
 def _severity_emoji(severity: str) -> str:
@@ -238,11 +368,11 @@ def _severity_emoji(severity: str) -> str:
 def _risk_badge_color(color: str) -> str:
     """Map the risk_scorer colour name to a hex value."""
     return {
-        "green": "#52c41a",
+        "green": "#3fb950",
         "orange": "#faad14",
-        "red": "#ff4d4f",
+        "red": "#dc3545",
         "darkred": "#a8071a",
-    }.get(color, "#8892b0")
+    }.get(color, "#8b949e")
 
 
 def _get_applicant_name(documents: list[dict]) -> str:
@@ -302,10 +432,36 @@ def _run_pipeline(uploaded_files) -> dict:
             text=f"🔍 Running OCR on {filename}…",
         )
         try:
-            raw_text = extract_text(tmp_path)
+            ocr_result: OCRResult = extract_text(tmp_path)
+            raw_text = ocr_result.text
+
+            if ocr_result.status == "failed":
+                st.error(
+                    f"❌ **{filename}**: OCR was unable to extract text from this document.  \n"
+                    f"This is likely due to a noisy, blurry, or low-quality scan. "
+                    f"Please try uploading a clearer copy of the document.  \n"
+                    f"{'  \\n'.join(ocr_result.diagnostics)}"
+                )
+            elif ocr_result.status == "partial":
+                st.warning(
+                    f"⚠️ **{filename}**: OCR partially succeeded — "
+                    f"{ocr_result.pages_succeeded}/{ocr_result.pages_total} pages "
+                    f"processed ({ocr_result.total_chars} chars).  \n"
+                    f"{'  \n'.join(ocr_result.diagnostics)}"
+                )
+            else:
+                logger.info(
+                    "OCR succeeded for %s: %d chars in %.1fs",
+                    filename, ocr_result.total_chars, ocr_result.elapsed_seconds,
+                )
+        except (FileNotFoundError, ValueError) as exc:
+            st.error(f"❌ **{filename}**: {exc}")
+            raw_text = ""
+            ocr_result = OCRResult(status="failed", diagnostics=[str(exc)])
         except Exception as exc:
             st.warning(f"OCR failed for {filename}: {exc}")
             raw_text = ""
+            ocr_result = OCRResult(status="failed", diagnostics=[str(exc)])
 
         # Step 2: Classify
         current_step += 1
@@ -335,6 +491,8 @@ def _run_pipeline(uploaded_files) -> dict:
                 "fields_found": 0,
                 "fields_missing": [],
                 "raw_text_length": len(raw_text),
+                "ocr_status": ocr_result.status,
+                "ocr_diagnostics": ocr_result.diagnostics,
             }
         else:
             try:
@@ -348,6 +506,8 @@ def _run_pipeline(uploaded_files) -> dict:
                     "fields_found": extraction.fields_found,
                     "fields_missing": extraction.fields_missing,
                     "raw_text_length": extraction.raw_text_length,
+                    "ocr_status": ocr_result.status,
+                    "ocr_diagnostics": ocr_result.diagnostics,
                 }
             except ValueError as exc:
                 st.warning(f"⚠️ **{filename}**: Field extraction failed — {exc}")
@@ -360,19 +520,10 @@ def _run_pipeline(uploaded_files) -> dict:
                     "fields_found": 0,
                     "fields_missing": [],
                     "raw_text_length": len(raw_text),
+                    "ocr_status": ocr_result.status,
+                    "ocr_diagnostics": ocr_result.diagnostics,
                 }
         documents.append(doc_record)
-
-    try:
-        raw_text = extract_text(tmp_path)
-    except Exception as exc:
-        st.error(f"OCR ERROR: {exc}")
-        raw_text = ""
-
-    # ADD THIS TEMPORARILY
-    st.markdown(f"**Debug — {filename}**")
-    st.write(f"Characters extracted: {len(raw_text)}")
-    st.text_area("Raw text", raw_text[:2000], height=200)
 
     # ------------------------------------------------------------------
     # Phase 2 — Cross-document validation
@@ -554,7 +705,7 @@ def _render_tab_case_overview(results: dict):
     col_h, col_m, col_l, col_t = st.columns(4)
     with col_h:
         st.markdown(f"""
-        <div class="info-card" style="text-align: center; border-left: 3px solid #ff4d4f;">
+        <div class="info-card" style="text-align: center; border-left: 3px solid #dc3545;">
             <h4>🔴 High</h4>
             <p>{score['high_count']}</p>
         </div>
@@ -568,14 +719,14 @@ def _render_tab_case_overview(results: dict):
         """, unsafe_allow_html=True)
     with col_l:
         st.markdown(f"""
-        <div class="info-card" style="text-align: center; border-left: 3px solid #52c41a;">
+        <div class="info-card" style="text-align: center; border-left: 3px solid #3fb950;">
             <h4>🟢 Low</h4>
             <p>{score['low_count']}</p>
         </div>
         """, unsafe_allow_html=True)
     with col_t:
         st.markdown(f"""
-        <div class="info-card" style="text-align: center; border-left: 3px solid #667eea;">
+        <div class="info-card" style="text-align: center; border-left: 3px solid #00e5ff;">
             <h4>📋 Total</h4>
             <p>{score['total_flags']}</p>
         </div>
@@ -587,10 +738,13 @@ def _render_tab_case_overview(results: dict):
     for doc in documents:
         label = doc["document_type"].replace("_", " ").title()
         confidence = doc.get("classification_confidence", 0)
+        ocr_status = doc.get("ocr_status", "success")
+        ocr_badge = {"success": "✅", "partial": "⚠️", "failed": "❌"}.get(ocr_status, "❓")
         st.markdown(
-            f"- **{doc['filename']}** → `{label}` "
+            f"- {ocr_badge} **{doc['filename']}** → `{label}` "
             f"(confidence: {confidence:.0%}, "
-            f"{doc['fields_found']} fields extracted)"
+            f"{doc['fields_found']} fields extracted, "
+            f"OCR: {ocr_status})"
         )
 
 
@@ -605,6 +759,21 @@ def _render_tab_extracted_data(results: dict):
     for doc in documents:
         label = doc["document_type"].replace("_", " ").title()
         st.markdown(f"### 📄 {label} — `{doc['filename']}`")
+
+        # Show OCR status warning if applicable
+        ocr_status = doc.get("ocr_status", "success")
+        if ocr_status == "failed":
+            st.error(
+                f"❌ **OCR failed** — unable to extract text from this document. "
+                f"This is likely due to a noisy, blurry, or low-quality scan. "
+                f"Please try uploading a clearer copy.  \n"
+                + "  \n".join(doc.get("ocr_diagnostics", []))
+            )
+        elif ocr_status == "partial":
+            st.warning(
+                f"⚠️ **Partial OCR** — some pages could not be processed.  \n"
+                + "  \n".join(doc.get("ocr_diagnostics", []))
+            )
 
         fields = doc.get("fields", {})
         if not fields:
@@ -649,13 +818,13 @@ def _render_tab_tampering(results: dict):
         risk_level = result.get("risk_level", "unknown")
         
         risk_colors = {
-            "clean": "#52c41a",
+            "clean": "#3fb950",
             "low_suspicion": "#faad14",
             "suspicious": "#ff7a00",
-            "high_risk": "#ff4d4f",
-            "unknown": "#8892b0",
+            "high_risk": "#dc3545",
+            "unknown": "#8b949e",
         }
-        color = risk_colors.get(risk_level, "#8892b0")
+        color = risk_colors.get(risk_level, "#8b949e")
         
         st.markdown(f"### 🔬 {filename}")
         st.markdown(
@@ -839,8 +1008,8 @@ def _render_tab_financial(results: dict):
         y=credits,
         mode="lines+markers",
         name="Credits",
-        line=dict(color="#667eea", width=3),
-        marker=dict(size=8, color="#667eea"),
+        line=dict(color="#00e5ff", width=2),
+        marker=dict(size=6, color="#00e5ff"),
     ))
 
     # Debits line
@@ -849,8 +1018,8 @@ def _render_tab_financial(results: dict):
         y=debits,
         mode="lines+markers",
         name="Debits",
-        line=dict(color="#764ba2", width=3),
-        marker=dict(size=8, color="#764ba2"),
+        line=dict(color="#58a6ff", width=2),
+        marker=dict(size=6, color="#58a6ff"),
     ))
 
     # Anomaly markers — big red dots
@@ -869,27 +1038,27 @@ def _render_tab_financial(results: dict):
             mode="markers",
             name="⚠ Anomaly",
             marker=dict(
-                size=16,
-                color="#ff4d4f",
+                size=14,
+                color="#dc3545",
                 symbol="diamond",
-                line=dict(width=2, color="#fff"),
+                line=dict(width=1, color="#e6edf3"),
             ),
         ))
 
     fig.update_layout(
         template="plotly_dark",
         paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(26,26,46,0.5)",
-        font=dict(family="Inter", color="#ccd6f6"),
-        title=dict(text="Monthly Credits & Debits", font=dict(size=18)),
-        xaxis=dict(title="Month", gridcolor="rgba(255,255,255,0.05)"),
-        yaxis=dict(title="Amount (₹)", gridcolor="rgba(255,255,255,0.05)"),
+        plot_bgcolor="rgba(13,17,23,0.6)",
+        font=dict(family="Inter", color="#e6edf3"),
+        title=dict(text="Monthly Credits & Debits", font=dict(size=14, color="#8b949e")),
+        xaxis=dict(title="Month", gridcolor="rgba(0,229,255,0.04)"),
+        yaxis=dict(title="Amount (₹)", gridcolor="rgba(0,229,255,0.04)"),
         legend=dict(orientation="h", yanchor="bottom", y=-0.2, x=0.5, xanchor="center"),
         margin=dict(l=60, r=30, t=50, b=60),
-        height=450,
+        height=420,
     )
 
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
 
     # ── Anomaly flags ──
     if flags:
@@ -917,12 +1086,12 @@ def _render_tab_recommendation(results: dict):
     # ── Decision card ──
     st.markdown(f"""
     <div class="decision-card">
-        <p style="font-size: 0.85rem; color: #8892b0; text-transform: uppercase;
-                  letter-spacing: 2px; margin-bottom: 0.5rem;">Underwriter Recommendation</p>
-        <h2 style="color: {badge_color}; margin: 0 0 1rem 0; font-size: 2rem;">
+        <p style="font-size: 0.7rem; color: #8b949e; text-transform: uppercase;
+                  letter-spacing: 2.5px; margin-bottom: 0.5rem;">Underwriter Recommendation</p>
+        <h2 style="color: {badge_color}; margin: 0 0 1rem 0; font-size: 1.75rem; font-weight: 700;">
             {recommendation['decision']}
         </h2>
-        <p style="color: #ccd6f6; font-size: 1.05rem; line-height: 1.7;">
+        <p style="color: #e6edf3; font-size: 0.95rem; line-height: 1.7;">
             {recommendation['reasoning']}
         </p>
     </div>
@@ -963,13 +1132,13 @@ def _render_tab_recommendation(results: dict):
 with st.sidebar:
     st.markdown("""
     <div style="text-align: center; padding: 1.5rem 0;">
-        <p style="font-size: 1.8rem; font-weight: 800; margin: 0;
-                  background: linear-gradient(135deg, #667eea, #764ba2);
-                  -webkit-background-clip: text; -webkit-text-fill-color: transparent;">
+        <p style="font-size: 1.5rem; font-weight: 700; margin: 0;
+                  color: #00e5ff; letter-spacing: -0.5px;">
             🔍 ForeSight
         </p>
-        <p style="font-size: 0.85rem; color: #8892b0; margin-top: 0.25rem;">
-            AI-Powered Document Fraud Detection
+        <p style="font-size: 0.75rem; color: #8b949e; margin-top: 0.25rem;
+                  text-transform: uppercase; letter-spacing: 2px;">
+            Document Fraud Detection
         </p>
     </div>
     """, unsafe_allow_html=True)
@@ -987,7 +1156,7 @@ with st.sidebar:
 
     analyze_btn = st.button(
         "🚀 Analyze Documents",
-        use_container_width=True,
+        width='stretch',
         type="primary",
         disabled=not uploaded_files,
     )
@@ -995,10 +1164,10 @@ with st.sidebar:
     st.divider()
 
     st.markdown("""
-    <div style="padding: 0.75rem; background: rgba(102,126,234,0.08);
-                border-radius: 8px; border-left: 3px solid #667eea;">
-        <p style="font-size: 0.8rem; margin: 0; line-height: 1.6;">
-            <strong>Supported documents:</strong><br>
+    <div style="padding: 0.75rem; background: rgba(0,229,255,0.04);
+                border-radius: 6px; border-left: 2px solid rgba(0,229,255,0.3);">
+        <p style="font-size: 0.75rem; margin: 0; line-height: 1.7; color: #8b949e;">
+            <strong style="color: #e6edf3;">Supported documents</strong><br>
             • Identity Proof (Aadhaar / PAN / Passport)<br>
             • Land Records<br>
             • Sale Deed<br>
@@ -1010,7 +1179,7 @@ with st.sidebar:
 
     if "results" in st.session_state:
         st.markdown("")
-        if st.button("🗑️ Clear Results", use_container_width=True):
+        if st.button("🗑️ Clear Results", width='stretch'):
             del st.session_state["results"]
             st.rerun()
 
@@ -1044,29 +1213,29 @@ if "results" not in st.session_state:
     with col1:
         st.markdown("""
         <div class="info-card" style="text-align: center;">
-            <p style="font-size: 2rem; margin-bottom: 0.5rem;">📄</p>
-            <h4 style="font-size: 0.9rem !important;">Upload Documents</h4>
-            <p style="font-size: 0.85rem !important; color: #8892b0 !important; font-weight: 400 !important;">
-                Upload PDFs or images of identity proofs, land records, sale deeds, and bank statements
+            <p style="font-size: 1.5rem; margin-bottom: 0.5rem;">📄</p>
+            <h4 style="font-size: 0.8rem !important; color: #e6edf3 !important;">Upload</h4>
+            <p style="font-size: 0.78rem !important; color: #8b949e !important; font-weight: 400 !important;">
+                PDFs or images — identity proofs, land records, sale deeds, bank statements
             </p>
         </div>
         """, unsafe_allow_html=True)
     with col2:
         st.markdown("""
         <div class="info-card" style="text-align: center;">
-            <p style="font-size: 2rem; margin-bottom: 0.5rem;">🤖</p>
-            <h4 style="font-size: 0.9rem !important;">AI Analysis</h4>
-            <p style="font-size: 0.85rem !important; color: #8892b0 !important; font-weight: 400 !important;">
-                OCR extraction, field parsing, cross-document validation, metadata and financial checks
+            <p style="font-size: 1.5rem; margin-bottom: 0.5rem;">🤖</p>
+            <h4 style="font-size: 0.8rem !important; color: #e6edf3 !important;">Analyze</h4>
+            <p style="font-size: 0.78rem !important; color: #8b949e !important; font-weight: 400 !important;">
+                OCR, field extraction, cross-document validation, metadata & financial checks
             </p>
         </div>
         """, unsafe_allow_html=True)
     with col3:
         st.markdown("""
         <div class="info-card" style="text-align: center;">
-            <p style="font-size: 2rem; margin-bottom: 0.5rem;">✅</p>
-            <h4 style="font-size: 0.9rem !important;">Risk Assessment</h4>
-            <p style="font-size: 0.85rem !important; color: #8892b0 !important; font-weight: 400 !important;">
+            <p style="font-size: 1.5rem; margin-bottom: 0.5rem;">✅</p>
+            <h4 style="font-size: 0.8rem !important; color: #e6edf3 !important;">Assess</h4>
+            <p style="font-size: 0.78rem !important; color: #8b949e !important; font-weight: 400 !important;">
                 Trust score, risk classification, and actionable underwriter recommendations
             </p>
         </div>
@@ -1103,10 +1272,10 @@ with tab4:
     _render_tab_metadata(results)
 
 with tab5:
-    _render_tab_financial(results)
+    _render_tab_tampering(results)
 
 with tab6:
-    _render_tab_recommendation(results)
+    _render_tab_financial(results)
 
 with tab7:
-    _render_tab_tampering(results)
+    _render_tab_recommendation(results)

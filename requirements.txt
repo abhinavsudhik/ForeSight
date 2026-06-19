@@ -3,7 +3,10 @@ fastapi
 uvicorn
 pymupdf          # PDF parsing (imported as fitz)
 pdfplumber       # Text extraction (fast-path for text-based PDFs)
-google-genai # Google Gemini API for OCR
+surya-ocr        # Offline OCR engine
+sentence-transformers  # CrossEncoder NLI for document classification
+torch            # PyTorch backend (MPS on Apple M1)
+transformers     # HuggingFace transformers for QA pipeline
 python-dotenv # Load environment variables from .env
 spacy            # NLP / entity extraction
 rapidfuzz        # Fuzzy name/address matching

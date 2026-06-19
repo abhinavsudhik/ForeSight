@@ -10,37 +10,27 @@ Document → Fields:
   Valuation Report → property_id, valuation_amount, date, appraiser
   Bank Statement   → account_holder, account_number, monthly_credits, monthly_debits
 
-Extraction approach (three layers — Gemini → Regex → spaCy NER):
-  1. Gemini LLM   — primary: sends raw OCR text to Gemini for intelligent
-                     structured extraction. Handles names without labels,
-                     Indian document formats, and ambiguous layouts.
+Extraction approach (three layers — QA Model → Regex → spaCy NER):
+  1. QA Model      — primary: uses deepset/roberta-base-squad2 extractive QA
+                     to pull field values from raw OCR text.
   2. Regex         — fallback: fills gaps with pattern-matched fields
                      (dates, ID numbers, amounts, survey numbers, etc.)
   3. spaCy NER     — final fallback: picks up remaining names (PERSON)
                      and addresses (GPE, LOC) that regex missed.
 """
-
 import os
+# Force offline mode for HuggingFace hub
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
 import re
-import json
 import logging
 from dataclasses import dataclass, field
 from typing import Optional
 
 import spacy
-from google import genai
-from dotenv import load_dotenv
-from backend.modules import gemini_client
-
-# Load environment variables from .env file
-load_dotenv()
 
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Gemini configuration
-# ---------------------------------------------------------------------------
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
 # ---------------------------------------------------------------------------
 # Lazy-loaded spaCy model
@@ -611,10 +601,10 @@ _EXTRACTORS: dict[str, callable] = {
 
 
 # ---------------------------------------------------------------------------
-# Gemini LLM extraction — primary layer
+# QA model extraction — primary layer
 # ---------------------------------------------------------------------------
 
-# Schema of expected fields per document type (used in the Gemini prompt)
+# Schema of expected fields per document type (used as QA questions)
 _FIELD_SCHEMAS: dict[str, dict[str, str]] = {
     # ── Original types ──
     "identity_proof": {
@@ -883,102 +873,84 @@ for _schema in _FIELD_SCHEMAS.values():
 
 
 
-def _gemini_extract_fields(
+# ---------------------------------------------------------------------------
+# Lazy-loaded QA pipeline (deepset/roberta-base-squad2)
+# ---------------------------------------------------------------------------
+_qa_pipeline = None
+
+
+def _get_qa_pipeline():
+    """Load the QA pipeline on first call and cache it."""
+    global _qa_pipeline
+    if _qa_pipeline is None:
+        import torch
+        from transformers import pipeline as hf_pipeline
+
+        device = "mps" if torch.backends.mps.is_available() else "cpu"
+        logger.info(
+            "Loading QA model (deepset/roberta-base-squad2) on device '%s' …", device
+        )
+        _qa_pipeline = hf_pipeline(
+            "question-answering",
+            model="deepset/roberta-base-squad2",
+            device=device,
+        )
+        logger.info("QA model loaded successfully.")
+    return _qa_pipeline
+
+
+def _qa_extract_fields(
     text: str, document_type: str
 ) -> dict[str, Optional[str]]:
     """
-    Use Gemini LLM to extract structured fields from raw OCR text.
+    Use deepset/roberta-base-squad2 extractive QA to pull field values
+    from raw OCR text.
 
-    This is the primary extraction method. It sends a text-only request
-    to Gemini with a document-type-aware prompt asking for JSON output.
+    For each field in the document type's schema, constructs a natural-
+    language question from the field description and runs the QA model.
 
-    Returns a dict of field_name → value (or None if not found).
-    Returns an empty dict if Gemini is unavailable or fails.
+    Returns a dict of field_name → value (or None if not found / low score).
+    Returns an empty dict if the model fails to load.
     """
-    if not gemini_client.is_gemini_available():
-        logger.warning("Gemini API not configured — skipping Gemini extraction")
+    try:
+        qa = _get_qa_pipeline()
+    except Exception as exc:
+        logger.error("Failed to load QA model: %s", exc)
         return {}
 
     schema = _FIELD_SCHEMAS.get(document_type)
     if not schema:
         logger.warning(
-            "No Gemini schema for document type '%s' — skipping", document_type
+            "No QA schema for document type '%s' — skipping", document_type
         )
         return {}
 
-    # Build a field description list for the prompt
-    field_descriptions = "\n".join(
-        f'  - "{key}": {desc}' for key, desc in schema.items()
+    # Truncate context to 3000 chars for efficiency
+    context = text[:3000]
+
+    result: dict[str, Optional[str]] = {}
+    for field_name, description in schema.items():
+        # Construct a natural language question from the description
+        question = f"What is the {description}?"
+
+        try:
+            answer = qa(question=question, context=context)
+            if answer["score"] > 0.15:
+                result[field_name] = answer["answer"].strip()
+            else:
+                result[field_name] = None
+        except Exception as exc:
+            logger.debug(
+                "QA failed for field '%s': %s", field_name, exc
+            )
+            result[field_name] = None
+
+    found_count = sum(1 for v in result.values() if v is not None)
+    logger.info(
+        "QA extracted %d/%d fields for '%s'",
+        found_count, len(schema), document_type,
     )
-
-    prompt = f"""You are a precise document data extractor. You will be given raw OCR text from an Indian document classified as "{document_type.replace('_', ' ')}".
-
-Extract the following fields from the text:
-{field_descriptions}
-
-IMPORTANT RULES:
-1. Names may NOT have a label like "Name:" before them. Use context clues:
-   - On Aadhaar cards, the name appears near the top, above the DOB/Gender line.
-   - On PAN cards, the name is below "Permanent Account Number" and above "Father's Name".
-   - On bank passbooks, look for the name near "Account Holder", "Customer Name", or after honorifics like Mr./Mrs./Ms., or near S/o, D/o, W/o.
-   - On sale deeds, look for names after "hereinafter called the vendor/vendee" or "first party/second party".
-2. Return values EXACTLY as they appear in the text — do not correct spelling.
-3. For monetary amounts, include the number only (no currency symbols).
-4. If a field cannot be found, set its value to null.
-5. Return ONLY a valid JSON object with the field names as keys. No explanation, no markdown.
-
-RAW OCR TEXT:
----
-{text[:4000]}
----
-
-JSON output:"""
-
-    try:
-        logger.info("Calling Gemini for field extraction (%s) …", document_type)
-        response = gemini_client.generate_content(
-            model=GEMINI_MODEL,
-            contents=[prompt],
-        )
-
-        raw_response = (response.text or "").strip()
-        logger.debug("Gemini raw response: %s", raw_response[:500])
-
-        # Strip markdown code fences if present
-        if raw_response.startswith("```"):
-            # Remove ```json ... ``` or ``` ... ```
-            lines = raw_response.split("\n")
-            # Drop first line (```json) and last line (```)
-            if lines[-1].strip() == "```":
-                lines = lines[1:-1]
-            else:
-                lines = lines[1:]
-            raw_response = "\n".join(lines).strip()
-
-        parsed = json.loads(raw_response)
-
-        # Normalise: ensure all expected keys exist, convert empty strings to None
-        result: dict[str, Optional[str]] = {}
-        for key in schema:
-            val = parsed.get(key)
-            if val is None or (isinstance(val, str) and not val.strip()):
-                result[key] = None
-            else:
-                result[key] = str(val).strip()
-
-        found_count = sum(1 for v in result.values() if v is not None)
-        logger.info(
-            "Gemini extracted %d/%d fields for '%s'",
-            found_count, len(schema), document_type,
-        )
-        return result
-
-    except json.JSONDecodeError as exc:
-        logger.warning("Gemini returned invalid JSON: %s", exc)
-        return {}
-    except Exception as exc:
-        logger.error("Gemini field extraction failed: %s", exc)
-        return {}
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1012,16 +984,14 @@ def extract_fields(text: str, document_type: str) -> ExtractionResult:
     """
     Extract structured fields from raw document text.
 
-    Workflow (three layers — Gemini → Regex → spaCy NER)
-    -----------------------------------------------------
-    1. **Gemini LLM** (primary): Send the raw text to Gemini and ask it
-       to return a JSON object of extracted fields. This handles names
-       that appear without labels, Indian document formats, and complex
-       layouts that regex cannot parse.
-    2. **Regex + spaCy NER** (fallback): For any fields that Gemini
-       returned as ``null`` or if Gemini fails entirely, run the
-       existing regex patterns and NER pipeline to fill the gaps.
-    3. **Merge**: Gemini results take priority; regex/NER fills blanks.
+    Workflow (three layers — QA Model → Regex → spaCy NER)
+    -------------------------------------------------------
+    1. **QA Model** (primary): Use deepset/roberta-base-squad2 to extract
+       field values via extractive question answering.
+    2. **Regex + spaCy NER** (fallback): For any fields that the QA model
+       returned as ``None`` or if it fails entirely, run the existing
+       regex patterns and NER pipeline to fill the gaps.
+    3. **Merge**: QA results take priority; regex/NER fills blanks.
 
     Parameters
     ----------
@@ -1069,8 +1039,8 @@ def extract_fields(text: str, document_type: str) -> ExtractionResult:
     extractor = _EXTRACTORS[document_type]
     logger.info("Extracting fields for document type '%s' …", document_type)
 
-    # --- Layer 1: Gemini LLM extraction (primary) ---
-    gemini_fields = _gemini_extract_fields(text, document_type)
+    # --- Layer 1: QA model extraction (primary) ---
+    qa_fields = _qa_extract_fields(text, document_type)
 
     # --- Layer 2+3: Regex + spaCy NER extraction (fallback) ---
     regex_ner_fields = extractor(text)
@@ -1080,24 +1050,24 @@ def extract_fields(text: str, document_type: str) -> ExtractionResult:
     regex_ner_fields["issue date"] = issue_date_val
     regex_ner_fields["issue_date"] = issue_date_val
 
-    # --- Merge: Gemini takes priority, regex/NER fills gaps ---
-    if gemini_fields:
+    # --- Merge: QA takes priority, regex/NER fills gaps ---
+    if qa_fields:
         fields = {}
         for key in regex_ner_fields:
-            gemini_val = gemini_fields.get(key)
+            qa_val = qa_fields.get(key)
             regex_val = regex_ner_fields.get(key)
-            # Prefer Gemini's value if available, else fall back to regex/NER
-            fields[key] = gemini_val if gemini_val is not None else regex_val
+            # Prefer QA model's value if available, else fall back to regex/NER
+            fields[key] = qa_val if qa_val is not None else regex_val
         logger.info(
-            "Merged fields — Gemini provided %d, regex/NER filled %d gaps",
-            sum(1 for k in fields if gemini_fields.get(k) is not None),
+            "Merged fields — QA provided %d, regex/NER filled %d gaps",
+            sum(1 for k in fields if qa_fields.get(k) is not None),
             sum(1 for k in fields
-                if gemini_fields.get(k) is None and regex_ner_fields.get(k) is not None),
+                if qa_fields.get(k) is None and regex_ner_fields.get(k) is not None),
         )
     else:
-        # Gemini failed entirely — use regex/NER only
+        # QA model failed entirely — use regex/NER only
         fields = regex_ner_fields
-        logger.info("Gemini unavailable — using regex/NER extraction only")
+        logger.info("QA model unavailable — using regex/NER extraction only")
 
     # --- Build diagnostics ---
     found = [k for k, v in fields.items() if v is not None]

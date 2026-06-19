@@ -46,10 +46,14 @@ def _create_heatmap_overlay(
     anomaly_map: np.ndarray,
     colormap: int = cv2.COLORMAP_JET,
     alpha: float = 0.45,
+    min_val: Optional[float] = None,
+    max_val: Optional[float] = None,
 ) -> str:
     """
     Blend an anomaly map over the original image and return
     the result as a base64-encoded PNG string.
+    Only colors regions where there is an actual anomaly, keeping
+    clean regions completely transparent.
     
     Parameters
     ----------
@@ -57,15 +61,22 @@ def _create_heatmap_overlay(
     anomaly_map  : Grayscale NumPy array (float or uint8, same spatial size)
     colormap     : OpenCV colormap constant (JET = blue→red, HOT = black→red)
     alpha        : Opacity of the heatmap layer (0.0 = invisible, 1.0 = opaque)
+    min_val      : Optional minimum value to start scaling (values below this are 0)
+    max_val      : Optional maximum value where scaling saturates (values above this are 255)
     
     Returns
     -------
     str  : base64-encoded PNG — paste directly into st.image()
     """
-    # Normalize anomaly map to 0-255 uint8
+    # Normalize anomaly map to 0-255 using provided or auto limits
     norm = anomaly_map.astype(np.float32)
-    if norm.max() > norm.min():
-        norm = (norm - norm.min()) / (norm.max() - norm.min()) * 255
+    if min_val is None:
+        min_val = norm.min()
+    if max_val is None:
+        max_val = max(norm.max(), min_val + 1e-5)
+    
+    # Scale and clamp to [0, 255]
+    norm = np.clip((norm - min_val) / (max_val - min_val), 0.0, 1.0) * 255
     norm = norm.astype(np.uint8)
     
     # Resize to match original if needed
@@ -75,8 +86,18 @@ def _create_heatmap_overlay(
     # Apply colormap → produces a BGR colour image
     heatmap_colored = cv2.applyColorMap(norm, colormap)
     
-    # Blend with original
-    overlay = cv2.addWeighted(original_cv, 1 - alpha, heatmap_colored, alpha, 0)
+    # Create a dynamic blending mask:
+    # - Subtle base tint (alpha=0.18) for clean areas (intensity = 0.0)
+    # - Strong highlight (alpha=0.65) for maximum anomaly (intensity = 1.0)
+    intensity = norm.astype(np.float32) / 255.0
+    alpha_base = 0.18
+    alpha_max = 0.65
+    blend_mask = alpha_base + intensity * (alpha_max - alpha_base)
+    blend_mask = np.expand_dims(blend_mask, axis=2)
+    
+    # Blend with original using the dynamic mask
+    overlay = original_cv.astype(np.float32) * (1.0 - blend_mask) + heatmap_colored.astype(np.float32) * blend_mask
+    overlay = np.clip(overlay, 0, 255).astype(np.uint8)
     
     # Encode to base64 PNG
     _, buffer = cv2.imencode(".png", overlay)
@@ -159,8 +180,9 @@ def _check_ela(pil_img: Image.Image, cv_img: np.ndarray) -> dict:
             },
         })
     
-    # Create heatmap overlay
-    heatmap_b64 = _create_heatmap_overlay(cv_img, ela_map, cv2.COLORMAP_HOT)
+    heatmap_b64 = _create_heatmap_overlay(
+        cv_img, ela_map, cv2.COLORMAP_JET, min_val=4.0, max_val=20.0
+    )
     
     return {
         "check": "ela",
@@ -247,7 +269,9 @@ def _check_blur_inconsistency(cv_img: np.ndarray) -> dict:
             },
         })
     
-    heatmap_b64 = _create_heatmap_overlay(cv_img, deviation_map * 128)
+    heatmap_b64 = _create_heatmap_overlay(
+        cv_img, deviation_map, cv2.COLORMAP_JET, min_val=1.0, max_val=4.0
+    )
     
     return {
         "check": "blur",
@@ -338,7 +362,9 @@ def _check_noise_inconsistency(cv_img: np.ndarray) -> dict:
             },
         })
     
-    heatmap_b64 = _create_heatmap_overlay(cv_img, noise_map * 60)
+    heatmap_b64 = _create_heatmap_overlay(
+        cv_img, noise_map, cv2.COLORMAP_JET, min_val=1.5, max_val=4.0
+    )
     
     return {
         "check": "noise",
@@ -427,9 +453,9 @@ def _check_pixel_artifacts(cv_img: np.ndarray) -> dict:
             },
         })
     
-    # Normalize artifact map for display
-    display_map = np.clip(artifact_map, 0, 5.0)
-    heatmap_b64 = _create_heatmap_overlay(cv_img, display_map * 50)
+    heatmap_b64 = _create_heatmap_overlay(
+        cv_img, artifact_map, cv2.COLORMAP_JET, min_val=1.2, max_val=2.5
+    )
     
     return {
         "check": "artifacts",
@@ -474,7 +500,9 @@ def _check_copy_paste(cv_img: np.ndarray) -> dict:
         return {
             "check": "copy_paste",
             "label": "Copy-Paste Detection",
-            "heatmap_b64": _create_heatmap_overlay(cv_img, copy_paste_map),
+            "heatmap_b64": _create_heatmap_overlay(
+                cv_img, copy_paste_map, cv2.COLORMAP_JET, min_val=1.0, max_val=255.0
+            ),
             "mean_value": 0,
             "flags": [],
             "description": "Not enough keypoints found for copy-paste analysis.",
@@ -530,7 +558,9 @@ def _check_copy_paste(cv_img: np.ndarray) -> dict:
             },
         })
     
-    heatmap_b64 = _create_heatmap_overlay(cv_img, copy_paste_map)
+    heatmap_b64 = _create_heatmap_overlay(
+        cv_img, copy_paste_map, cv2.COLORMAP_JET, min_val=1.0, max_val=255.0
+    )
     
     return {
         "check": "copy_paste",
