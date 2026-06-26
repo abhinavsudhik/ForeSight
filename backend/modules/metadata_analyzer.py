@@ -150,12 +150,62 @@ def _is_generic_author(author: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Digital-native detection
+# ---------------------------------------------------------------------------
+
+def _is_likely_digital_native(pdf_meta: dict, ocr_method: str = "unknown") -> bool:
+    """
+    Returns True if the PDF was likely generated digitally
+    (not a scan of a physical document).
+
+    A scanned PDF will have:
+    - OCR method = "surya_ocr" (pdfplumber found < 50 chars)
+    - Producer = a scanner driver or empty
+
+    A digital-native PDF will have:
+    - Producer = Word, LibreOffice, bank software, reportlab, etc.
+    - OCR method = "pdfplumber" (text extracted directly)
+    """
+    producer = (pdf_meta.get("producer") or "").lower().strip()
+
+    DIGITAL_PRODUCERS = {
+        "microsoft word", "libreoffice", "openoffice", "apache",
+        "wkhtmltopdf", "fpdf", "reportlab", "itext", "pdftron",
+        "adobe livecycle", "pdfcreator", "nitro", "foxit",
+        "acrobat distiller", "mac os x", "quartz", "cairo",
+        "ghostscript", "prince", "weasyprint", "chromium",
+        "google docs", "pdf24",
+    }
+
+    producer_is_digital = any(p in producer for p in DIGITAL_PRODUCERS)
+    ocr_was_needed = ocr_method == "surya_ocr"
+
+    # If OCR was needed, it's a scan → not digital native
+    if ocr_was_needed:
+        return False
+
+    # If producer indicates a digital tool, it's native
+    if producer_is_digital:
+        return True
+
+    # Default conservative: if producer is empty or scanner-like,
+    # treat as scan
+    SCANNER_HINTS = {"scan", "twain", "camera", "capture", "hp ", "canon",
+                     "epson", "brother", "xerox", "kodak"}
+    if any(s in producer for s in SCANNER_HINTS):
+        return False
+
+    return False  # when in doubt, treat as scan
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
 def analyze_metadata(
     pdf_path: str,
     document_issue_date: Optional[Union[str, dict]] = None,
+    ocr_method: str = "unknown",
 ) -> dict:
     """
     Extract PDF metadata and flag suspicious patterns.
@@ -239,7 +289,9 @@ def analyze_metadata(
     )
 
     # --- Flag 1: Modification date after the document's issue date ---
-    if modification_dt and document_issue_date:
+    # Only flag for digital-native PDFs — scanned docs always have a
+    # modification date set by the scanner software, which is benign.
+    if _is_likely_digital_native(pdf_meta, ocr_method) and modification_dt and document_issue_date:
         # Parse the document issue date
         issue_dt = _parse_document_date(document_issue_date)
         
@@ -321,6 +373,9 @@ def analyze_metadata(
                     "days_old": (datetime.now() - creation_dt).days,
                 },
             })
+
+    # Record digital-native status in metadata
+    metadata["is_digital_native"] = _is_likely_digital_native(pdf_meta, ocr_method)
 
     logger.info("Metadata analysis complete — %d flag(s)", len(flags))
 

@@ -49,6 +49,7 @@ DOCUMENT_TYPES: dict[str, str] = {
     "bank_statement": "Bank Statement / Passbook — record of transactions from a bank account",
 
     # ── Property Ownership & Clearance Records ──
+    "agreement_to_sell": "Agreement to Sell — preliminary contract detailing terms of property transfer",
     "sale_deed": "Sale Deed — registered deed transferring property ownership from seller to buyer",
     "title_deed": "Title Deed — legal document proving ownership of property",
     "mutation_certificate": "Mutation Certificate / Khata Transfer — revenue record of property ownership change",
@@ -112,6 +113,11 @@ KEYWORDS: dict[str, list[str]] = {
     "driving_licence": [
         "driving licence", "driving license", "rto",
         "motor vehicle", "transport",
+    ],
+    "agreement_to_sell": [
+        "agreement to sell", "agreement of sale", "sale agreement",
+        "earnest money", "advance amount", "period of agreement", "agree to sell",
+        "seller", "buyer",
     ],
     "sale_deed": [
         "sale deed", "deed of sale", "vendor", "vendee",
@@ -224,8 +230,8 @@ KEYWORDS: dict[str, list[str]] = {
     ],
     "power_of_attorney": [
         "power of attorney", "poa", "attorney",
-        "principal", "agent", "authorise",
-        "hereby appoint",
+        "principal", "agent", "authorise", "authorize",
+        "hereby appoint", "appoint", "executant",
     ],
     "nach_ecs_mandate": [
         "nach", "ecs", "mandate", "auto debit",
@@ -319,29 +325,45 @@ def _nli_classify(text: str) -> Optional[ClassificationResult]:
         if scores.ndim == 1:
             scores = np.expand_dims(scores, axis=0)
 
-        # Extract entailment class scores (index 2)
-        entailment_scores = scores[:, 2]
+        # Extract entailment class scores (index 1)
+        entailment_scores = scores[:, 1]
 
-        # Pick the best label
-        best_idx = int(np.argmax(entailment_scores))
+        # Calculate keyword hits to apply logit boost for robust zero-shot grounding
+        text_lower = text.lower()
+        keyword_hits = {}
+        for category, keywords in KEYWORDS.items():
+            hits = sum(1 for kw in keywords if kw in text_lower)
+            keyword_hits[category] = hits
+
+        # Combine NLI scores with keyword boost (+2.0 per unique keyword hit)
+        boosted_scores = []
+        for idx, label in enumerate(labels):
+            hits = keyword_hits.get(label, 0)
+            boost = 2.0 * hits
+            boosted_scores.append(entailment_scores[idx] + boost)
+
+        boosted_scores = np.array(boosted_scores)
+
+        # Pick the best label using boosted scores
+        best_idx = int(np.argmax(boosted_scores))
         best_label = labels[best_idx]
 
-        # Compute confidence: softmax of top score vs second-best
-        sorted_scores = np.sort(entailment_scores)[::-1]
+        # Compute confidence using the boosted scores: softmax of top score vs second-best
+        sorted_scores = np.sort(boosted_scores)[::-1]
         top_two = sorted_scores[:2]
         exp_scores = np.exp(top_two - np.max(top_two))  # numerical stability
         softmax_probs = exp_scores / exp_scores.sum()
         confidence = float(softmax_probs[0])  # probability of top choice
 
         logger.info(
-            "NLI classified as '%s' (confidence %.0f%%)",
+            "NLI hybrid classified as '%s' (confidence %.0f%%)",
             best_label, confidence * 100,
         )
 
         return ClassificationResult(
             label=best_label,
             confidence=round(confidence, 4),
-            scores={},  # No keyword scores when using NLI model
+            scores=keyword_hits,  # Return the actual keyword hit counts for transparency
         )
 
     except Exception as exc:

@@ -102,10 +102,10 @@ class InconsistencyFlag:
 def _collect_values(
     documents: list[dict],
     keys: frozenset[str],
-) -> list[tuple[str, str, str]]:
+) -> list[tuple[int, str, str, str]]:
     """
-    Walk through every document dict and collect (doc_label, field_key, value)
-    triples for the requested field keys.
+    Walk through every document dict and collect (doc_index, doc_label, field_key, value)
+    quadruples for the requested field keys.
 
     Parameters
     ----------
@@ -117,10 +117,10 @@ def _collect_values(
 
     Returns
     -------
-    list[tuple[str, str, str]]
-        (doc_label, field_key, value) — only entries with non-empty values.
+    list[tuple[int, str, str, str]]
+        (doc_index, doc_label, field_key, value) — only entries with non-empty values.
     """
-    results: list[tuple[str, str, str]] = []
+    results: list[tuple[int, str, str, str]] = []
     for idx, doc in enumerate(documents):
         doc_type = doc.get("document_type", f"doc_{idx + 1}")
         fields = doc.get("fields", {})
@@ -128,7 +128,7 @@ def _collect_values(
             value = fields.get(key)
             if value and str(value).strip():
                 label = f"{doc_type} (doc {idx + 1})"
-                results.append((label, key, str(value).strip()))
+                results.append((idx, label, key, str(value).strip()))
     return results
 
 
@@ -167,14 +167,18 @@ def _check_name_consistency(
     flags: list[InconsistencyFlag] = []
     seen: set[tuple[int, int]] = set()
 
-    for i, (label_a, key_a, val_a) in enumerate(entries):
-        for j, (label_b, key_b, val_b) in enumerate(entries):
+    for i, (idx_a, label_a, key_a, val_a) in enumerate(entries):
+        for j, (idx_b, label_b, key_b, val_b) in enumerate(entries):
             if i >= j:
                 continue
             pair = (i, j)
             if pair in seen:
                 continue
             seen.add(pair)
+
+            # Skip comparisons of fields within the same document
+            if idx_a == idx_b:
+                continue
 
             score = fuzz.ratio(val_a.lower(), val_b.lower())
             if score < _NAME_SIMILARITY_THRESHOLD:
@@ -211,14 +215,18 @@ def _check_property_id_consistency(
     flags: list[InconsistencyFlag] = []
     seen: set[tuple[int, int]] = set()
 
-    for i, (label_a, key_a, val_a) in enumerate(entries):
-        for j, (label_b, key_b, val_b) in enumerate(entries):
+    for i, (idx_a, label_a, key_a, val_a) in enumerate(entries):
+        for j, (idx_b, label_b, key_b, val_b) in enumerate(entries):
             if i >= j:
                 continue
             pair = (i, j)
             if pair in seen:
                 continue
             seen.add(pair)
+
+            # Skip comparisons of fields within the same document
+            if idx_a == idx_b:
+                continue
 
             # Normalise for comparison (strip, upper-case)
             norm_a = val_a.strip().upper()
@@ -251,10 +259,22 @@ def _check_timeline_consistency(
 
     Rules
     -----
-    * Valuation date must NOT be **after** the sale deed date.
-    * Land record date must NOT be **after** the sale deed date.
+    * Documents with a lower type-order should have an earlier or equal
+      date compared to documents with a higher type-order.
+    * Identity proofs are excluded from timeline analysis (order = 0).
     """
     flags: list[InconsistencyFlag] = []
+
+    # Document type ordering hierarchy for timeline checks
+    DOC_TYPE_ORDER = {
+        "land_record": 1,
+        "valuation_report": 2,
+        "bank_statement": 3,
+        "agreement_to_sell": 4,
+        "power_of_attorney": 5,
+        "sale_deed": 6,
+        "identity_proof": 0,  # 0 = excluded from timeline
+    }
 
     # Collect dates keyed by document type
     dated_docs: list[dict] = []
@@ -262,12 +282,27 @@ def _check_timeline_consistency(
         doc_type = doc.get("document_type", f"doc_{idx + 1}")
         fields = doc.get("fields", {})
 
-        # Grab the "date" field (Sale Deed, Valuation Report use "date")
-        date_str = fields.get("date")
-        # Also check "dob" for identity docs, but DOB is not timeline-relevant
-        # across other doc types — skip it.
+        # Check multiple date field names, not just "date"
+        date_str = (
+            fields.get("date")
+            or fields.get("issue_date")
+            or fields.get("issue date")
+            or fields.get("registration_date")
+            or fields.get("deed_date")
+        )
+        # Explicitly exclude "dob" — date of birth is not a document date
 
         parsed = _parse_date(date_str) if date_str else None
+
+        # Warning diagnostic when date parsing fails
+        if date_str and not parsed:
+            logger.warning(
+                "Timeline check: could not parse date '%s' for doc type '%s' "
+                "(possibly OCR noise — e.g. letter O instead of digit 0). "
+                "This document is excluded from timeline analysis.",
+                date_str, doc_type
+            )
+
         if parsed:
             dated_docs.append({
                 "doc_type": doc_type,
@@ -279,41 +314,40 @@ def _check_timeline_consistency(
     if len(dated_docs) < 2:
         return []
 
-    # Find the sale deed date (anchor)
-    sale_deed_entry = None
-    for entry in dated_docs:
-        if entry["doc_type"] == "sale_deed":
-            sale_deed_entry = entry
-            break
+    # Filter to docs with parseable dates and known ordering
+    timeline_docs = [
+        d for d in dated_docs
+        if DOC_TYPE_ORDER.get(d["doc_type"], -1) > 0
+    ]
 
-    if sale_deed_entry is None:
-        # No sale deed to anchor against — cannot check timeline
+    if len(timeline_docs) < 2:
         return []
 
-    sale_date = sale_deed_entry["date"]
+    # Sort by expected order
+    timeline_docs.sort(key=lambda d: DOC_TYPE_ORDER.get(d["doc_type"], 99))
 
-    # Check each other document's date against the sale deed
-    for entry in dated_docs:
-        if entry["doc_type"] == "sale_deed":
-            continue
-
-        if entry["doc_type"] in ("valuation_report", "land_record"):
-            if entry["date"] > sale_date:
-                flags.append(InconsistencyFlag(
-                    check="timeline_consistency",
-                    severity="medium",
-                    evidence={
-                        entry["doc_type"]: entry["date_str"],
-                        "sale_deed": sale_deed_entry["date_str"],
-                    },
-                    message=(
-                        f"Impossible timeline: {entry['doc_type']} date "
-                        f"({entry['date_str']}) is after the sale deed date "
-                        f"({sale_deed_entry['date_str']})"
-                    ),
-                ))
+    # Check each consecutive pair — earlier doc_type should have
+    # earlier or equal date
+    for i in range(len(timeline_docs) - 1):
+        earlier = timeline_docs[i]
+        later = timeline_docs[i + 1]
+        if earlier["date"] > later["date"]:
+            flags.append(InconsistencyFlag(
+                check="timeline_consistency",
+                severity="medium",
+                evidence={
+                    earlier["doc_type"]: earlier["date_str"],
+                    later["doc_type"]: later["date_str"],
+                },
+                message=(
+                    f"Impossible timeline: {earlier['doc_type']} date "
+                    f"({earlier['date_str']}) is after "
+                    f"{later['doc_type']} date ({later['date_str']})"
+                ),
+            ))
 
     return flags
+
 
 
 # ---------------------------------------------------------------------------

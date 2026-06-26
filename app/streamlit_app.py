@@ -59,7 +59,7 @@ logger = logging.getLogger(__name__)
 # ═══════════════════════════════════════════════════════════════════════════
 st.set_page_config(
     page_title="ForeSight — Document Fraud Detection",
-    page_icon="🔍",
+    page_icon="🟢",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -360,9 +360,9 @@ def _severity_emoji(severity: str) -> str:
     """Map severity to a coloured emoji."""
     return {
         "high": "🔴",
-        "medium": "🟡",
+        "medium": "�",
         "low": "🟢",
-    }.get(severity.lower(), "⚪")
+    }.get(severity.lower(), "🟢")
 
 
 def _risk_badge_color(color: str) -> str:
@@ -429,7 +429,7 @@ def _run_pipeline(uploaded_files) -> dict:
         current_step += 1
         progress.progress(
             current_step / total_steps,
-            text=f"🔍 Running OCR on {filename}…",
+            text=f"Running OCR on {filename}…",
         )
         try:
             ocr_result: OCRResult = extract_text(tmp_path)
@@ -437,14 +437,14 @@ def _run_pipeline(uploaded_files) -> dict:
 
             if ocr_result.status == "failed":
                 st.error(
-                    f"❌ **{filename}**: OCR was unable to extract text from this document.  \n"
+                    f"🔴 **{filename}**: OCR was unable to extract text from this document.  \n"
                     f"This is likely due to a noisy, blurry, or low-quality scan. "
                     f"Please try uploading a clearer copy of the document.  \n"
                     f"{'  \\n'.join(ocr_result.diagnostics)}"
                 )
             elif ocr_result.status == "partial":
                 st.warning(
-                    f"⚠️ **{filename}**: OCR partially succeeded — "
+                    f"� **{filename}**: OCR partially succeeded — "
                     f"{ocr_result.pages_succeeded}/{ocr_result.pages_total} pages "
                     f"processed ({ocr_result.total_chars} chars).  \n"
                     f"{'  \n'.join(ocr_result.diagnostics)}"
@@ -455,7 +455,7 @@ def _run_pipeline(uploaded_files) -> dict:
                     filename, ocr_result.total_chars, ocr_result.elapsed_seconds,
                 )
         except (FileNotFoundError, ValueError) as exc:
-            st.error(f"❌ **{filename}**: {exc}")
+            st.error(f"🔴 **{filename}**: {exc}")
             raw_text = ""
             ocr_result = OCRResult(status="failed", diagnostics=[str(exc)])
         except Exception as exc:
@@ -467,7 +467,7 @@ def _run_pipeline(uploaded_files) -> dict:
         current_step += 1
         progress.progress(
             current_step / total_steps,
-            text=f"📑 Classifying {filename}…",
+            text=f"Classifying {filename}…",
         )
         classification = classify_document(raw_text)
 
@@ -475,11 +475,11 @@ def _run_pipeline(uploaded_files) -> dict:
         current_step += 1
         progress.progress(
             current_step / total_steps,
-            text=f"📋 Extracting fields from {filename}…",
+            text=f"Extracting fields from {filename}…",
         )
         if classification.label == "unknown":
             st.warning(
-                f"⚠️ **{filename}**: Could not determine document type "
+                f"� **{filename}**: Could not determine document type "
                 f"(no keyword matches). Skipping field extraction."
             )
             doc_record = {
@@ -493,6 +493,7 @@ def _run_pipeline(uploaded_files) -> dict:
                 "raw_text_length": len(raw_text),
                 "ocr_status": ocr_result.status,
                 "ocr_diagnostics": ocr_result.diagnostics,
+                "ocr_method": ocr_result.method,
             }
         else:
             try:
@@ -508,9 +509,10 @@ def _run_pipeline(uploaded_files) -> dict:
                     "raw_text_length": extraction.raw_text_length,
                     "ocr_status": ocr_result.status,
                     "ocr_diagnostics": ocr_result.diagnostics,
+                    "ocr_method": ocr_result.method,
                 }
             except ValueError as exc:
-                st.warning(f"⚠️ **{filename}**: Field extraction failed — {exc}")
+                st.warning(f"� **{filename}**: Field extraction failed — {exc}")
                 doc_record = {
                     "filename": filename,
                     "tmp_path": tmp_path,
@@ -522,6 +524,7 @@ def _run_pipeline(uploaded_files) -> dict:
                     "raw_text_length": len(raw_text),
                     "ocr_status": ocr_result.status,
                     "ocr_diagnostics": ocr_result.diagnostics,
+                    "ocr_method": ocr_result.method,
                 }
         documents.append(doc_record)
 
@@ -531,7 +534,7 @@ def _run_pipeline(uploaded_files) -> dict:
     current_step += 1
     progress.progress(
         current_step / total_steps,
-        text="🔗 Running cross-document checks…",
+        text="Running cross-document checks…",
     )
     cross_doc_flags = cross_validate(documents)
 
@@ -541,13 +544,17 @@ def _run_pipeline(uploaded_files) -> dict:
     current_step += 1
     progress.progress(
         current_step / total_steps,
-        text="🔒 Analysing PDF metadata…",
+        text="Analysing PDF metadata…",
     )
     all_metadata_flags: list[dict] = []
     for doc in documents:
         if doc["tmp_path"].lower().endswith(".pdf"):
             # Pass the fields dictionary to let the analyzer fetch the issue date
-            meta_result = analyze_metadata(doc["tmp_path"], doc["fields"])
+            meta_result = analyze_metadata(
+                doc["tmp_path"],
+                doc["fields"],
+                ocr_method=doc.get("ocr_method", "unknown"),
+            )
             all_metadata_results.append({
                 "filename": doc["filename"],
                 "metadata": meta_result["metadata"],
@@ -561,7 +568,7 @@ def _run_pipeline(uploaded_files) -> dict:
     current_step += 1
     progress.progress(
         current_step / total_steps,
-        text="🔬 Running visual tampering analysis…",
+        text="Running visual tampering analysis…",
     )
     all_tampering_results = []
     for doc in documents:
@@ -585,7 +592,7 @@ def _run_pipeline(uploaded_files) -> dict:
     current_step += 1
     progress.progress(
         current_step / total_steps,
-        text="📊 Detecting financial anomalies…",
+        text="Detecting financial anomalies…",
     )
     financial_flags: list[dict] = []
     for doc in documents:
@@ -593,6 +600,7 @@ def _run_pipeline(uploaded_files) -> dict:
             financial_result = detect_financial_anomalies(
                 monthly_credits=doc["fields"].get("monthly_credits"),
                 monthly_debits=doc["fields"].get("monthly_debits"),
+                month_labels=doc["fields"].get("month_labels"),
             )
             financial_flags = financial_result.get("flags", [])
             break  # only one bank statement expected
@@ -608,7 +616,7 @@ def _run_pipeline(uploaded_files) -> dict:
 
     progress.progress(
         current_step / total_steps,
-        text="⚖️ Calculating trust score…",
+        text="Calculating trust score…",
     )
     
     score_result = calculate_trust_score(
@@ -619,7 +627,7 @@ def _run_pipeline(uploaded_files) -> dict:
     )
     recommendation = generate_recommendation(score_result)
 
-    progress.progress(1.0, text="✅ Analysis complete!")
+    progress.progress(1.0, text="🟢 Analysis complete!")
 
     return {
         "case_id": case_id,
@@ -701,6 +709,22 @@ def _render_tab_case_overview(results: dict):
 
     st.markdown("<div style='height: 1rem'></div>", unsafe_allow_html=True)
 
+    # ── Hard-kill warning banner ──
+    if results["score_result"].get("hard_kill_triggered"):
+        st.markdown("""
+        <div style="background: rgba(220,53,69,0.12); border: 1px solid #dc3545;
+                    border-radius: 6px; padding: 1rem 1.25rem; margin-top: 1rem;">
+            <p style="color: #dc3545; font-weight: 700; margin: 0; font-size: 0.9rem;">
+                🔴 HARD KILL RULE TRIGGERED
+            </p>
+            <p style="color: #e6edf3; margin: 0.4rem 0 0 0; font-size: 0.85rem;">
+                A critical fraud indicator (identity or property mismatch) was
+                detected. Score has been capped regardless of other signals.
+                This application requires immediate escalation.
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
+
     # ── Flag counts ──
     col_h, col_m, col_l, col_t = st.columns(4)
     with col_h:
@@ -713,7 +737,7 @@ def _render_tab_case_overview(results: dict):
     with col_m:
         st.markdown(f"""
         <div class="info-card" style="text-align: center; border-left: 3px solid #faad14;">
-            <h4>🟡 Medium</h4>
+            <h4>� Medium</h4>
             <p>{score['medium_count']}</p>
         </div>
         """, unsafe_allow_html=True)
@@ -727,19 +751,53 @@ def _render_tab_case_overview(results: dict):
     with col_t:
         st.markdown(f"""
         <div class="info-card" style="text-align: center; border-left: 3px solid #00e5ff;">
-            <h4>📋 Total</h4>
+            <h4>Total</h4>
             <p>{score['total_flags']}</p>
         </div>
         """, unsafe_allow_html=True)
 
+    # ── Score deductions breakdown ──
+    st.markdown("<div style='height: 1.5rem'></div>", unsafe_allow_html=True)
+    st.markdown("#### Score Deductions Breakdown")
+    deductions = score.get("deductions_breakdown", [])
+    if not deductions:
+        st.success("🟢 No score deductions — all checks passed successfully.")
+    else:
+        table_rows = []
+        for d in deductions:
+            sev = d.get("severity", "low").lower()
+            if sev == "high":
+                sev_display = "🔴 High"
+            elif sev == "medium":
+                sev_display = "� Medium"
+            else:
+                sev_display = "🟢 Low"
+            
+            check_name = d.get("check", "unknown").replace("_", " ").title()
+            if d.get("type") == "hard_kill_cap":
+                check_name = "Critical Fraud Indicator Cap"
+            elif d.get("type") == "tampering_multiplier":
+                check_name = "Visual Tampering Multiplier"
+
+            penalty_display = f"-{d['penalty']} pts"
+            message = d.get("message", "")
+            
+            table_rows.append({
+                "Check / Factor": check_name,
+                "Severity": sev_display,
+                "Score Deduction": penalty_display,
+                "Details": message
+            })
+        st.table(table_rows)
+
     # ── Documents processed ──
     st.markdown("<div style='height: 1rem'></div>", unsafe_allow_html=True)
-    st.markdown("#### 📄 Documents Processed")
+    st.markdown("#### Documents Processed")
     for doc in documents:
         label = doc["document_type"].replace("_", " ").title()
         confidence = doc.get("classification_confidence", 0)
         ocr_status = doc.get("ocr_status", "success")
-        ocr_badge = {"success": "✅", "partial": "⚠️", "failed": "❌"}.get(ocr_status, "❓")
+        ocr_badge = {"success": "🟢", "partial": "�", "failed": "🔴"}.get(ocr_status, "🔴")
         st.markdown(
             f"- {ocr_badge} **{doc['filename']}** → `{label}` "
             f"(confidence: {confidence:.0%}, "
@@ -758,20 +816,20 @@ def _render_tab_extracted_data(results: dict):
 
     for doc in documents:
         label = doc["document_type"].replace("_", " ").title()
-        st.markdown(f"### 📄 {label} — `{doc['filename']}`")
+        st.markdown(f"### {label} — `{doc['filename']}`")
 
         # Show OCR status warning if applicable
         ocr_status = doc.get("ocr_status", "success")
         if ocr_status == "failed":
             st.error(
-                f"❌ **OCR failed** — unable to extract text from this document. "
+                f"🔴 **OCR failed** — unable to extract text from this document. "
                 f"This is likely due to a noisy, blurry, or low-quality scan. "
                 f"Please try uploading a clearer copy.  \n"
                 + "  \n".join(doc.get("ocr_diagnostics", []))
             )
         elif ocr_status == "partial":
             st.warning(
-                f"⚠️ **Partial OCR** — some pages could not be processed.  \n"
+                f"� **Partial OCR** — some pages could not be processed.  \n"
                 + "  \n".join(doc.get("ocr_diagnostics", []))
             )
 
@@ -796,11 +854,11 @@ def _render_tab_extracted_data(results: dict):
 
         if missing:
             st.caption(
-                f"✅ {found}/{total} fields extracted  ·  "
-                f"❌ Missing: {', '.join(m.replace('_', ' ').title() for m in missing)}"
+                f"🟢 {found}/{total} fields extracted  ·  "
+                f"🔴 Missing: {', '.join(m.replace('_', ' ').title() for m in missing)}"
             )
         else:
-            st.caption(f"✅ All {total} fields extracted successfully")
+            st.caption(f"🟢 All {total} fields extracted successfully")
 
         st.divider()
 
@@ -826,7 +884,7 @@ def _render_tab_tampering(results: dict):
         }
         color = risk_colors.get(risk_level, "#8b949e")
         
-        st.markdown(f"### 🔬 {filename}")
+        st.markdown(f"### {filename}")
         st.markdown(
             f"**Overall Assessment:** "
             f"<span style='color:{color}; font-weight:700;'>"
@@ -841,30 +899,32 @@ def _render_tab_tampering(results: dict):
             continue
         
         # Render each check's heatmap in a grid
-        cols = st.columns(min(len(checks), 3))
-        for i, check in enumerate(checks):
-            col = cols[i % 3]
-            with col:
-                st.markdown(f"**{check['label']}**")
-                heatmap = check.get("heatmap_b64")
-                if heatmap:
-                    st.image(
-                        f"data:image/png;base64,{heatmap}",
-                        width=300,
-                    )
-                else:
-                    st.caption("No heatmap available.")
-                st.caption(check.get("description", ""))
-                
-                flags = check.get("flags", [])
-                for flag in flags:
-                    sev = flag.get("severity", "low")
-                    if sev == "high":
-                        st.error(f"🔴 {flag['message']}")
-                    elif sev == "medium":
-                        st.warning(f"🟡 {flag['message']}")
+        cols_per_row = 3
+        for r in range(0, len(checks), cols_per_row):
+            row_checks = checks[r:r + cols_per_row]
+            cols = st.columns(cols_per_row)
+            for i, check in enumerate(row_checks):
+                with cols[i]:
+                    st.markdown(f"**{check['label']}**")
+                    heatmap = check.get("heatmap_b64")
+                    if heatmap:
+                        st.image(
+                            f"data:image/png;base64,{heatmap}",
+                            width='stretch',
+                        )
                     else:
-                        st.info(f"🟢 {flag['message']}")
+                        st.caption("No heatmap available.")
+                    st.caption(check.get("description", ""))
+                    
+                    flags = check.get("flags", [])
+                    for flag in flags:
+                        sev = flag.get("severity", "low")
+                        if sev == "high":
+                            st.error(f"🔴 {flag['message']}")
+                        elif sev == "medium":
+                            st.warning(f"� {flag['message']}")
+                        else:
+                            st.info(f"🟢 {flag['message']}")
         
         st.divider()
 
@@ -876,10 +936,10 @@ def _render_tab_cross_doc_flags(results: dict):
     cross_doc_flags = results["cross_doc_flags"]
 
     if not cross_doc_flags:
-        st.success("✅ No cross-document inconsistencies detected — all documents are consistent.")
+        st.success("🟢 No cross-document inconsistencies detected — all documents are consistent.")
         return
 
-    st.markdown(f"### ⚠️ {len(cross_doc_flags)} Inconsistency Flag(s) Detected")
+    st.markdown(f"### {len(cross_doc_flags)} Inconsistency Flag(s) Detected")
     st.markdown("")
 
     for flag in cross_doc_flags:
@@ -921,7 +981,7 @@ def _render_tab_metadata(results: dict):
         return
 
     for meta in metadata_results:
-        st.markdown(f"### 📎 {meta['filename']}")
+        st.markdown(f"### {meta['filename']}")
 
         # Metadata table
         md = meta.get("metadata", {})
@@ -960,7 +1020,7 @@ def _render_tab_metadata(results: dict):
                 else:
                     st.info(f"{emoji} {msg}")
         else:
-            st.success("✅ No suspicious metadata patterns detected.")
+            st.success("🟢 No suspicious metadata patterns detected.")
 
         st.divider()
 
@@ -972,6 +1032,15 @@ def _render_tab_financial(results: dict):
     if not financial_result:
         st.info("No bank statement was uploaded — financial analysis was skipped.")
         return
+
+    # Data quality warning for insufficient per-month data
+    data_quality = financial_result.get("data_quality", "ok")
+    if data_quality == "insufficient_for_monthly_analysis":
+        st.warning(
+            "� Only aggregate totals were extracted from the bank statement — "
+            "per-month anomaly analysis requires at least 3 months of data. "
+            "Upload a multi-month bank statement for full analysis."
+        )
 
     chart_data = financial_result.get("chart_data", [])
     flags = financial_result.get("flags", [])
@@ -1036,7 +1105,7 @@ def _render_tab_financial(results: dict):
             x=anomaly_months,
             y=anomaly_values,
             mode="markers",
-            name="⚠ Anomaly",
+            name="🔴 Anomaly",
             marker=dict(
                 size=14,
                 color="#dc3545",
@@ -1062,7 +1131,7 @@ def _render_tab_financial(results: dict):
 
     # ── Anomaly flags ──
     if flags:
-        st.markdown("### ⚠️ Financial Anomalies")
+        st.markdown("### Financial Anomalies")
         for flag in flags:
             severity = flag.get("severity", "low")
             msg = flag.get("message", "")
@@ -1074,7 +1143,7 @@ def _render_tab_financial(results: dict):
             else:
                 st.info(f"{emoji} {msg}")
     else:
-        st.success("✅ No financial anomalies detected.")
+        st.success("🟢 No financial anomalies detected.")
 
 
 def _render_tab_recommendation(results: dict):
@@ -1101,7 +1170,7 @@ def _render_tab_recommendation(results: dict):
     evidence_cards = recommendation.get("evidence_cards", [])
 
     if evidence_cards:
-        st.markdown("### 📋 Evidence Summary")
+        st.markdown("### Evidence Summary")
         st.markdown(f"*{len(evidence_cards)} item(s) requiring attention:*")
         st.markdown("")
 
@@ -1122,7 +1191,7 @@ def _render_tab_recommendation(results: dict):
                 st.markdown("**Evidence:**")
                 st.json(card["evidence"])
     else:
-        st.success("✅ No issues to report — the application looks clean.")
+        st.success("🟢 No issues to report — the application looks clean.")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1134,7 +1203,7 @@ with st.sidebar:
     <div style="text-align: center; padding: 1.5rem 0;">
         <p style="font-size: 1.5rem; font-weight: 700; margin: 0;
                   color: #00e5ff; letter-spacing: -0.5px;">
-            🔍 ForeSight
+            🟢 ForeSight
         </p>
         <p style="font-size: 0.75rem; color: #8b949e; margin-top: 0.25rem;
                   text-transform: uppercase; letter-spacing: 2px;">
@@ -1155,7 +1224,7 @@ with st.sidebar:
     st.markdown("")
 
     analyze_btn = st.button(
-        "🚀 Analyze Documents",
+        "Analyze Documents",
         width='stretch',
         type="primary",
         disabled=not uploaded_files,
@@ -1179,7 +1248,7 @@ with st.sidebar:
 
     if "results" in st.session_state:
         st.markdown("")
-        if st.button("🗑️ Clear Results", width='stretch'):
+        if st.button("Clear Results", width='stretch'):
             del st.session_state["results"]
             st.rerun()
 
@@ -1213,7 +1282,7 @@ if "results" not in st.session_state:
     with col1:
         st.markdown("""
         <div class="info-card" style="text-align: center;">
-            <p style="font-size: 1.5rem; margin-bottom: 0.5rem;">📄</p>
+            <p style="font-size: 1.5rem; margin-bottom: 0.5rem;">🟢</p>
             <h4 style="font-size: 0.8rem !important; color: #e6edf3 !important;">Upload</h4>
             <p style="font-size: 0.78rem !important; color: #8b949e !important; font-weight: 400 !important;">
                 PDFs or images — identity proofs, land records, sale deeds, bank statements
@@ -1223,7 +1292,7 @@ if "results" not in st.session_state:
     with col2:
         st.markdown("""
         <div class="info-card" style="text-align: center;">
-            <p style="font-size: 1.5rem; margin-bottom: 0.5rem;">🤖</p>
+            <p style="font-size: 1.5rem; margin-bottom: 0.5rem;">�</p>
             <h4 style="font-size: 0.8rem !important; color: #e6edf3 !important;">Analyze</h4>
             <p style="font-size: 0.78rem !important; color: #8b949e !important; font-weight: 400 !important;">
                 OCR, field extraction, cross-document validation, metadata & financial checks
@@ -1233,7 +1302,7 @@ if "results" not in st.session_state:
     with col3:
         st.markdown("""
         <div class="info-card" style="text-align: center;">
-            <p style="font-size: 1.5rem; margin-bottom: 0.5rem;">✅</p>
+            <p style="font-size: 1.5rem; margin-bottom: 0.5rem;">🔴</p>
             <h4 style="font-size: 0.8rem !important; color: #e6edf3 !important;">Assess</h4>
             <p style="font-size: 0.78rem !important; color: #8b949e !important; font-weight: 400 !important;">
                 Trust score, risk classification, and actionable underwriter recommendations
@@ -1242,7 +1311,7 @@ if "results" not in st.session_state:
         """, unsafe_allow_html=True)
 
     st.markdown("")
-    st.info("👈 Upload documents using the sidebar and click **Analyze Documents** to begin.")
+    st.info("Upload documents using the sidebar and click **Analyze Documents** to begin.")
     st.stop()
 
 
@@ -1250,13 +1319,13 @@ if "results" not in st.session_state:
 results = st.session_state["results"]
 
 tab1, tab2, tab3, tab4, tab5, tab6 , tab7 = st.tabs([
-    "📊 Case Overview",
-    "📋 Extracted Data",
-    "🔗 Cross-Doc Flags",
-    "🔒 Metadata",
-    "🔬 Tampering",
-    "💰 Financial",
-    "✅ Recommendation",
+    "Case Overview",
+    "Extracted Data",
+    "Cross-Doc Flags",
+    "Metadata",
+    "Tampering",
+    "Financial",
+    "Recommendation",
 ])
 
 with tab1:

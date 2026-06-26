@@ -263,6 +263,57 @@ def _build_chart_data(
 
 
 # ---------------------------------------------------------------------------
+# Simplified checks for insufficient data
+# ---------------------------------------------------------------------------
+
+def _run_simplified_checks(credits: list[float], debits: list[float]) -> list[dict]:
+    """
+    Simplified checks when only aggregate data is available
+    (not per-month breakdowns).
+    """
+    flags = []
+
+    total_credits = sum(credits)
+    total_debits = sum(debits)
+
+    # Check 1: Credits << Debits (spending far exceeds income —
+    # unusual for a loan applicant wanting to show strong finances)
+    if total_debits > 0 and total_credits > 0:
+        ratio = total_credits / total_debits
+        if ratio < 0.5:
+            flags.append({
+                "check": "financial_anomaly",
+                "severity": "medium",
+                "message": (
+                    f"Total credits (\u20b9{total_credits:,.2f}) are less than half "
+                    f"of total debits (\u20b9{total_debits:,.2f}). This is unusual "
+                    f"for a loan applicant."
+                ),
+                "evidence": {
+                    "total_credits": total_credits,
+                    "total_debits": total_debits,
+                    "ratio": round(ratio, 2),
+                },
+            })
+
+    # Check 2: Suspiciously round numbers (possible fabrication)
+    for amount in credits + debits:
+        if amount > 10000 and amount % 10000 == 0:
+            flags.append({
+                "check": "financial_anomaly",
+                "severity": "low",
+                "message": (
+                    f"Amount \u20b9{amount:,.2f} is a suspiciously round number. "
+                    f"Real transaction totals are rarely exact multiples of 10,000."
+                ),
+                "evidence": {"amount": amount},
+            })
+            break  # flag once, not per round number
+
+    return flags
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -294,6 +345,9 @@ def detect_financial_anomalies(
             "summary": dict       — aggregate statistics
         }
     """
+    if isinstance(month_labels, str):
+        month_labels = [m.strip() for m in month_labels.split(",") if m.strip()]
+
     credits = _parse_monthly_data(monthly_credits)
     debits = _parse_monthly_data(monthly_debits)
 
@@ -307,6 +361,32 @@ def detect_financial_anomalies(
         credits.append(0.0)
     while len(debits) < length:
         debits.append(0.0)
+
+    # Data quality check: if we only have < 3 data points,
+    # per-month analysis is meaningless.
+    data_is_per_month = len(credits) >= 3 or len(debits) >= 3
+
+    if not data_is_per_month:
+        logger.warning(
+            "Financial analysis: only %d credit and %d debit data points "
+            "extracted. Per-month anomaly detection requires >= 3 months. "
+            "Running simplified checks only.",
+            len(credits), len(debits)
+        )
+        # Run simplified checks on whatever we have
+        simplified_flags = _run_simplified_checks(credits, debits)
+        chart_data = _build_chart_data(credits, debits, month_labels, simplified_flags)
+        return {
+            "flags": simplified_flags,
+            "chart_data": chart_data,
+            "summary": {
+                "total_credits": sum(credits),
+                "total_debits": sum(debits),
+                "months_analysed": max(len(credits), len(debits)),
+                "anomalies_found": len(simplified_flags),
+            },
+            "data_quality": "insufficient_for_monthly_analysis",
+        }
 
     if length < _MIN_MONTHS_FOR_ANALYSIS:
         logger.warning(

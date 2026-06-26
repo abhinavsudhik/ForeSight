@@ -484,6 +484,176 @@ def _extract_valuation_report(text: str) -> dict[str, Optional[str]]:
     return fields
 
 
+def _parse_transactions_to_monthly(text: str) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """
+    Parse transactions sequentially from the bank statement OCR text.
+    Groups them by month (YYYY-MM), sums up deposits and withdrawals,
+    and returns (monthly_credits_str, monthly_debits_str, month_labels_str).
+    """
+    # Standard months regex
+    months_regex_str = r"(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
+    
+    # Regex patterns for different date formats
+    # Month-Day (e.g. Feb 03, February 03)
+    month_day_pattern = re.compile(rf"\b({months_regex_str})\b[-.\s,]*\b(\d{{1,2}})\b", re.IGNORECASE)
+    # Day-Month (e.g. 03 Feb, 3 February)
+    day_month_pattern = re.compile(rf"\b(\d{{1,2}})\b[-.\s,]*\b({months_regex_str})\b", re.IGNORECASE)
+    # Numeric date (e.g. 03/02/2025, 2025-02-03)
+    numeric_date_pattern = re.compile(r"\b(\d{1,4})[\/\-\.](\d{1,2})[\/\-\.](\d{2,4})\b")
+    # Plausible year pattern (1990 to 2099)
+    year_pattern = re.compile(r"\b(19[9]\d|20\d{2})\b")
+
+    month_map = {
+        "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+        "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12
+    }
+
+    # Helper to clean amounts
+    amount_pattern = re.compile(r"\b\d{1,3}(?:,\d{3})*(?:\.\d{2})\b")
+
+    # Scan text to find the most common year as fallback default_year
+    all_years = [int(y) for y in year_pattern.findall(text)]
+    if all_years:
+        from collections import Counter
+        default_year = Counter(all_years).most_common(1)[0][0]
+    else:
+        import datetime
+        default_year = datetime.datetime.now().year
+
+    current_year = default_year
+    current_date = None
+    lines_since_date = 999
+    transactions = []
+
+    lines = text.split("\n")
+    for line in lines:
+        line_strip = line.strip()
+        if not line_strip:
+            continue
+        
+        if "TOTAL" in line_strip.upper():
+            continue
+
+        # Look for a year update in the line
+        year_match = year_pattern.search(line_strip)
+        if year_match:
+            current_year = int(year_match.group(1))
+
+        # Check for date match
+        date_found = False
+        month = None
+        year = current_year
+
+        # Try Month-Day first (e.g. Feb 03)
+        m = month_day_pattern.search(line_strip)
+        if m:
+            month_str = m.group(1).lower()[:3]
+            month = month_map.get(month_str, 1)
+            date_found = True
+        else:
+            # Try Day-Month (e.g. 03 Feb)
+            m = day_month_pattern.search(line_strip)
+            if m:
+                month_str = m.group(2).lower()[:3]
+                month = month_map.get(month_str, 1)
+                date_found = True
+            else:
+                # Try numeric date
+                m = numeric_date_pattern.search(line_strip)
+                if m:
+                    g1, g2, g3 = m.group(1), m.group(2), m.group(3)
+                    if len(g1) == 4: # YYYY-MM-DD
+                        year = int(g1)
+                        month = int(g2)
+                    elif len(g3) in (2, 4): # DD/MM/YYYY or MM/DD/YYYY
+                        year = int(g3)
+                        if year < 100:
+                            year += 2000
+                        if int(g2) > 12:
+                            month = int(g1)
+                        elif int(g1) > 12:
+                            month = int(g2)
+                        else:
+                            month = int(g1)
+                    date_found = True
+
+        if date_found and month is not None:
+            current_date = f"{year:04d}-{month:02d}"
+            lines_since_date = 0
+        else:
+            lines_since_date += 1
+
+        # Heuristic: reset current date if we go more than 2 lines without a transaction date.
+        # This keeps the context for description wrapping or nearby Opening Balance rows
+        # while preventing date persistence issues across pages/unrelated sections.
+        if lines_since_date > 2:
+            current_date = None
+
+        # Find amounts in this line
+        amounts = amount_pattern.findall(line_strip)
+        if amounts:
+            floats = []
+            for amt in amounts:
+                try:
+                    floats.append(float(amt.replace(",", "")))
+                except ValueError:
+                    pass
+            
+            if floats and current_date:
+                if "BALANCE FORWARD" in line_strip.upper() or "OPENING BALANCE" in line_strip.upper():
+                    transactions.append({
+                        "type": "balance_forward",
+                        "month_key": current_date,
+                        "amount": floats[-1]
+                    })
+                elif len(floats) >= 2:
+                    transactions.append({
+                        "type": "transaction",
+                        "month_key": current_date,
+                        "amount": floats[-2],
+                        "balance": floats[-1]
+                    })
+
+    if not transactions:
+        return None, None, None
+
+    # Calculate running balance and group by month
+    running_balance = None
+    monthly_data = {}
+
+    for tx in transactions:
+        mkey = tx["month_key"]
+        if mkey not in monthly_data:
+            monthly_data[mkey] = {"credits": 0.0, "debits": 0.0}
+
+        if tx["type"] == "balance_forward":
+            running_balance = tx["amount"]
+        elif tx["type"] == "transaction":
+            amount = tx["amount"]
+            balance = tx["balance"]
+            if running_balance is not None:
+                diff = balance - running_balance
+                if diff > 0.01:
+                    monthly_data[mkey]["credits"] += amount
+                elif diff < -0.01:
+                    monthly_data[mkey]["debits"] += amount
+            running_balance = balance
+
+    # Format output as comma-separated values sorted by month
+    sorted_months = sorted(monthly_data.keys())
+    if not sorted_months:
+        return None, None, None
+
+    credits_list = [f"{monthly_data[m]['credits']:.2f}" for m in sorted_months]
+    debits_list = [f"{monthly_data[m]['debits']:.2f}" for m in sorted_months]
+
+    return (
+        ", ".join(credits_list),
+        ", ".join(debits_list),
+        ", ".join(sorted_months)
+    )
+
+
 def _extract_bank_statement(text: str) -> dict[str, Optional[str]]:
     """
     Bank Statement → account_holder, account_number, monthly_credits, monthly_debits
@@ -496,6 +666,7 @@ def _extract_bank_statement(text: str) -> dict[str, Optional[str]]:
         "account_number": None,
         "monthly_credits": None,
         "monthly_debits": None,
+        "month_labels": None,
     }
 
     # --- Layer 1: Regex ---
@@ -509,19 +680,27 @@ def _extract_bank_statement(text: str) -> dict[str, Optional[str]]:
         acc_no = acc_candidates[0] if acc_candidates else None
     fields["account_number"] = acc_no
 
-    # Credits / Debits — look for labelled totals
-    credit_val = _find_labelled_value(
-        r"(?:total\s*)?(?:credit|credits|cr)\s*[:.]?\s*(?:₹|Rs\.?|INR)?\s*"
-        r"([\d,]+(?:\.\d{1,2})?)",
-        text,
-    )
-    debit_val = _find_labelled_value(
-        r"(?:total\s*)?(?:debit|debits|dr)\s*[:.]?\s*(?:₹|Rs\.?|INR)?\s*"
-        r"([\d,]+(?:\.\d{1,2})?)",
-        text,
-    )
-    fields["monthly_credits"] = credit_val
-    fields["monthly_debits"] = debit_val
+    # Try transaction state-machine parser first
+    monthly_credits, monthly_debits, month_labels = _parse_transactions_to_monthly(text)
+    if monthly_credits and monthly_debits:
+        fields["monthly_credits"] = monthly_credits
+        fields["monthly_debits"] = monthly_debits
+        fields["month_labels"] = month_labels
+    else:
+        # Credits / Debits fallback — look for labelled totals (deposits / withdrawals)
+        credit_val = _find_labelled_value(
+            r"(?:total\s*)?\b(?:credit|credits|cr|deposit|deposits)\b\s*[:.]?\s*(?:₹|Rs\.?|INR)?\s*"
+            r"([\d,]+(?:\.\d{1,2})?)",
+            text,
+        )
+        debit_val = _find_labelled_value(
+            r"(?:total\s*)?\b(?:debit|debits|dr|withdrawal|withdrawals)\b\s*[:.]?\s*(?:₹|Rs\.?|INR)?\s*"
+            r"([\d,]+(?:\.\d{1,2})?)",
+            text,
+        )
+        fields["monthly_credits"] = credit_val
+        fields["monthly_debits"] = debit_val
+        fields["month_labels"] = None
 
     # --- Layer 2: spaCy NER ---
     labelled_holder = _find_labelled_value(
@@ -570,6 +749,7 @@ _EXTRACTORS: dict[str, callable] = {
     "profit_loss_statement": _extract_bank_statement,
 
     # ── Property Ownership & Clearance Records ──
+    "agreement_to_sell": _extract_sale_deed,
     "title_deed": _extract_sale_deed,
     "mutation_certificate": _extract_land_record,
     "noc_certificate": _extract_identity_proof,
@@ -620,6 +800,13 @@ _FIELD_SCHEMAS: dict[str, dict[str, str]] = {
         "area": "Total area with unit (e.g. 5.5 acres, 2400 sq ft)",
         "address": "Location / address of the property",
     },
+    "agreement_to_sell": {
+        "seller_name": "Name of the seller",
+        "buyer_name": "Name of the buyer",
+        "property_id": "Property ID or number or survey number",
+        "date": "Date of the agreement",
+        "amount": "Sale consideration amount",
+    },
     "sale_deed": {
         "seller_name": "Name of the seller / vendor",
         "buyer_name": "Name of the buyer / vendee / purchaser",
@@ -638,6 +825,7 @@ _FIELD_SCHEMAS: dict[str, dict[str, str]] = {
         "account_number": "Bank account number",
         "monthly_credits": "Total credits / deposits amount",
         "monthly_debits": "Total debits / withdrawals amount",
+        "month_labels": "Month labels / periods",
     },
 
     # ── Identity & Address Proofs (KYC) ──
@@ -930,6 +1118,9 @@ def _qa_extract_fields(
 
     result: dict[str, Optional[str]] = {}
     for field_name, description in schema.items():
+        if field_name == "month_labels":
+            result[field_name] = None
+            continue
         # Construct a natural language question from the description
         question = f"What is the {description}?"
 

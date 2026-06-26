@@ -6,10 +6,10 @@ recommendation with a decision, reasoning, and per-flag evidence cards.
 
 Decision thresholds
 ───────────────────
-score >= 80  → "Approve — Low risk application"
-score 55-79  → "Manual Review Required — moderate inconsistencies detected"
-score 30-54  → "Legal Verification Required — significant fraud indicators"
-score < 30   → "Reject — Multiple high severity fraud indicators detected"
+score >= 85  → "Approve — Low risk application"
+score 65-84  → "Manual Review Required — moderate inconsistencies detected"
+score 40-64  → "Legal Verification Required — significant fraud indicators"
+score < 40   → "Reject — Multiple high severity fraud indicators detected"
 """
 
 import logging
@@ -22,8 +22,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 _DECISIONS = [
     {
-        "min": 80,
-        "max": 100,
+        "min": 85, "max": 100,
         "decision": "Approve",
         "reasoning": (
             "Low risk application. All documents appear consistent and "
@@ -32,36 +31,33 @@ _DECISIONS = [
         ),
     },
     {
-        "min": 55,
-        "max": 79,
+        "min": 65, "max": 84,
         "decision": "Manual Review Required",
         "reasoning": (
-            "Moderate inconsistencies were detected across the submitted "
-            "documents. An underwriter should manually review the flagged "
-            "items before proceeding. These may be benign data-entry errors "
-            "or genuine discrepancies."
+            "Moderate inconsistencies were detected. An underwriter should "
+            "manually review the flagged items before proceeding. These may "
+            "be benign data-entry errors or genuine discrepancies requiring "
+            "clarification from the applicant."
         ),
     },
     {
-        "min": 30,
-        "max": 54,
+        "min": 40, "max": 64,
         "decision": "Legal Verification Required",
         "reasoning": (
-            "Significant fraud indicators were found. The application "
-            "should not proceed until a legal team has verified the "
-            "authenticity of the flagged documents and resolved all "
-            "high-severity inconsistencies."
+            "Significant fraud indicators were found. The application should "
+            "not proceed until a legal team has verified the authenticity of "
+            "the flagged documents and resolved all high-severity "
+            "inconsistencies. Consider filing a SAR if indicators persist."
         ),
     },
     {
-        "min": 0,
-        "max": 29,
+        "min": 0, "max": 39,
         "decision": "Reject",
         "reasoning": (
-            "Multiple high-severity fraud indicators were detected. "
-            "The submitted documents show critical inconsistencies that "
-            "strongly suggest document tampering or identity fraud. "
-            "Immediate rejection is recommended."
+            "Multiple high-severity fraud indicators were detected. The "
+            "submitted documents show critical inconsistencies that strongly "
+            "suggest document tampering or identity fraud. Immediate rejection "
+            "is recommended. Escalate to fraud and compliance team."
         ),
     },
 ]

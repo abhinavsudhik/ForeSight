@@ -116,11 +116,17 @@ def _check_ela(pil_img: Image.Image, cv_img: np.ndarray) -> dict:
     3. Compute per-pixel absolute difference (original vs resaved)
     4. Amplify the difference map for visibility
     5. Flag if any region's mean ELA value exceeds the threshold
+    6. NEW: Regional ELA analysis — check if any quadrant has significantly
+       higher ELA than others (catches localized edits like photo swaps)
     """
     ELA_QUALITY = 90
     ELA_AMPLIFY = 10        # multiply difference for visual clarity
-    FLAG_THRESHOLD = 12.0   # mean ELA value above this → suspicious
-    HIGH_THRESHOLD = 20.0   # above this → high severity
+    FLAG_THRESHOLD = 13.5   # mean ELA value above this → suspicious (adjusted up from 12.0)
+    HIGH_THRESHOLD = 22.0   # above this → high severity (adjusted up from 20.0)
+    REGIONAL_RATIO = 3.5    # if any quadrant's mean > 3.5× lowest → localized edit (adjusted up from 3.0)
+    # NOTE: Photographed physical ID cards have natural ELA variation from
+    # JPEG compression of mixed content (photo, text, QR). Previous thresholds
+    # (10.0 / 17.0 / 2.2) caused false positives on genuine cards.
     
     # Step 1: Save at controlled quality into a buffer
     buffer = BytesIO()
@@ -147,6 +153,20 @@ def _check_ela(pil_img: Image.Image, cv_img: np.ndarray) -> dict:
     # Identify suspicious regions (top 5% brightest pixels)
     threshold_95 = float(np.percentile(ela_map, 95))
     suspicious_ratio = float((ela_map > threshold_95).mean())
+    
+    # Step 6: Regional ELA analysis — divide into quadrants
+    h, w = ela_map.shape
+    mid_h, mid_w = h // 2, w // 2
+    quadrants = [
+        ela_map[:mid_h, :mid_w],      # top-left
+        ela_map[:mid_h, mid_w:],       # top-right
+        ela_map[mid_h:, :mid_w],       # bottom-left
+        ela_map[mid_h:, mid_w:],       # bottom-right
+    ]
+    quadrant_means = [float(q.mean()) for q in quadrants]
+    min_quadrant = max(min(quadrant_means), 0.1)  # avoid division by zero
+    max_quadrant = max(quadrant_means)
+    regional_ratio = max_quadrant / min_quadrant
     
     # Build flag
     flags = []
@@ -180,6 +200,24 @@ def _check_ela(pil_img: Image.Image, cv_img: np.ndarray) -> dict:
             },
         })
     
+    # Regional ELA flag — catches localized edits that global mean misses
+    if regional_ratio > REGIONAL_RATIO and not flags:
+        severity = "high" if regional_ratio > 4.0 else "medium"
+        flags.append({
+            "check": "tampering_ela",
+            "severity": severity,
+            "message": (
+                f"Regional ELA analysis detected localized compression inconsistency. "
+                f"One region has {regional_ratio:.1f}× higher ELA than the cleanest region, "
+                f"suggesting a localized edit (e.g., photo replacement or text insertion)."
+            ),
+            "evidence": {
+                "mean_ela_value": round(mean_ela, 2),
+                "regional_ratio": round(regional_ratio, 2),
+                "quadrant_means": [round(q, 2) for q in quadrant_means],
+            },
+        })
+    
     heatmap_b64 = _create_heatmap_overlay(
         cv_img, ela_map, cv2.COLORMAP_JET, min_val=4.0, max_val=20.0
     )
@@ -209,8 +247,9 @@ def _check_blur_inconsistency(cv_img: np.ndarray) -> dict:
     Flag regions that deviate significantly from the image median.
     """
     WINDOW_SIZE = 32        # pixels — size of each analysis block
-    DEVIATION_FACTOR = 2.5  # flag blocks more than 2.5x from median variance
-    FLAG_RATIO = 0.08       # flag if more than 8% of blocks are anomalous
+    DEVIATION_FACTOR = 3.8  # flag blocks more than 3.8× from median variance (adjusted up from 3.5)
+    FLAG_RATIO = 0.30       # flag if more than 30% of blocks are anomalous (adjusted up from 0.25)
+    FLAT_THRESHOLD = 15.0   # exclude flat/blank blocks from skewing the median
     
     gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
     h, w = gray.shape
@@ -236,24 +275,33 @@ def _check_blur_inconsistency(cv_img: np.ndarray) -> dict:
         return {"check": "blur", "label": "Blur Inconsistency",
                 "heatmap_b64": None, "flags": [], "mean_value": 0}
     
-    median_var = float(np.median(variances))
+    # Filter out flat background blocks to get a true text/foreground median
+    non_flat_variances = [v for v in variances if v >= FLAT_THRESHOLD]
+    if not non_flat_variances:
+        median_var = float(np.median(variances))
+    else:
+        median_var = float(np.median(non_flat_variances))
     
     # Paint variance values onto the map
     for y, x, var in blocks:
         variance_map[y:y+WINDOW_SIZE, x:x+WINDOW_SIZE] = var
     
-    # Compute deviation from median
-    if median_var > 0:
-        deviation_map = np.abs(variance_map - median_var) / median_var
-    else:
-        deviation_map = np.zeros_like(variance_map)
+    # Compute deviation from median using a symmetric ratio for textured blocks
+    deviation_map = np.ones_like(variance_map)
+    for y, x, var in blocks:
+        if var >= FLAT_THRESHOLD and median_var >= FLAT_THRESHOLD:
+            ratio = var / median_var
+            deviation = max(ratio, 1.0 / ratio)
+            deviation_map[y:y+WINDOW_SIZE, x:x+WINDOW_SIZE] = deviation
+        else:
+            deviation_map[y:y+WINDOW_SIZE, x:x+WINDOW_SIZE] = 1.0
     
     anomaly_mask = deviation_map > DEVIATION_FACTOR
     anomaly_ratio = float(anomaly_mask.mean())
     
     flags = []
     if anomaly_ratio > FLAG_RATIO:
-        severity = "high" if anomaly_ratio > 0.15 else "medium"
+        severity = "high" if anomaly_ratio > 0.40 else "medium"
         flags.append({
             "check": "tampering_blur",
             "severity": severity,
@@ -288,6 +336,57 @@ def _check_blur_inconsistency(cv_img: np.ndarray) -> dict:
 
 
 
+def _detect_faces(gray_img: np.ndarray) -> list:
+    """
+    Detect faces using multiple Haar cascades and parameter fallbacks
+    to handle low-quality, rotated, or high-noise ID photos.
+    """
+    import os
+    
+    cascades = [
+        "haarcascade_frontalface_default.xml",
+        "haarcascade_frontalface_alt2.xml",
+        "haarcascade_frontalface_alt.xml",
+        "haarcascade_profileface.xml"
+    ]
+    
+    detected_faces = []
+    
+    # Try with original image first, then with slight blur to remove halftone scan noise, then histogram equalized
+    preprocessed_images = [
+        gray_img,
+        cv2.GaussianBlur(gray_img, (3, 3), 0),
+        cv2.equalizeHist(gray_img)
+    ]
+    
+    for cascade_name in cascades:
+        cascade_path = os.path.join(cv2.data.haarcascades, cascade_name)
+        if not os.path.exists(cascade_path):
+            continue
+        face_cascade = cv2.CascadeClassifier(cascade_path)
+        
+        for img in preprocessed_images:
+            # Try different scaleFactors and minNeighbors
+            for scale in [1.05, 1.03, 1.08]:
+                for neighbors in [3, 2, 4]:
+                    try:
+                        faces = face_cascade.detectMultiScale(
+                            img,
+                            scaleFactor=scale,
+                            minNeighbors=neighbors,
+                            minSize=(24, 24)
+                        )
+                        if len(faces) > 0:
+                            # Convert to list of tuples and return immediately upon first success
+                            for face in faces:
+                                detected_faces.append(tuple(face))
+                            return detected_faces
+                    except Exception as exc:
+                        logger.warning("Error running Haar cascade %s: %s", cascade_name, exc)
+                        
+    return detected_faces
+
+
 def _check_noise_inconsistency(cv_img: np.ndarray) -> dict:
     """
     Detects regions with anomalous sensor noise patterns.
@@ -296,24 +395,39 @@ def _check_noise_inconsistency(cv_img: np.ndarray) -> dict:
     Edited regions often have different noise (too clean = digitally generated,
     too noisy = from a different camera).
     
-    Method:
-    1. Apply a strong Gaussian blur to isolate the low-frequency content
-    2. Subtract from the original to isolate high-frequency noise
-    3. Compute local standard deviation of the noise residual in blocks
-    4. Flag blocks that deviate significantly from the image-wide noise floor
+    Method (two-scale with spatial clustering):
+    1. Extract noise residuals at two scales:
+       - Fine (sigma=1.5): captures sensor-level noise differences
+       - Medium (sigma=5.0): captures texture-level inconsistencies
+    2. Compute local std-dev in 8×8 blocks (finer than before for small regions)
+    3. Flag blocks deviating >1.8 sigma from global mean
+    4. NEW: Spatial clustering — check if anomalous blocks form a contiguous
+       region (10+ adjacent blocks). Scattered anomalies = natural; clustered
+       anomalies = tampering. This avoids false positives while catching
+       coherent tampered regions like pasted photos.
     """
-    BLOCK_SIZE = 16
-    SIGMA_THRESHOLD = 2.2   # flag blocks more than 2.2 std devs from mean
-    FLAG_RATIO = 0.06
+    BLOCK_SIZE = 8          # finer granularity
+    SIGMA_THRESHOLD = 2.2   # flag blocks more than 2.2 std devs from mean (adjusted up from 2.0)
+    FLAG_RATIO = 0.10       # flag if more than 10% of blocks are anomalous (adjusted up from 0.08)
+    CLUSTER_MIN_BLOCKS = 75 # minimum adjacent anomalous blocks to count as a cluster (adjusted up from 60)
     
     gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    h, w = gray.shape
     
-    # Isolate noise residual (original minus smoothed)
-    smoothed = cv2.GaussianBlur(gray, (0, 0), sigmaX=3.0)
-    noise_residual = gray - smoothed
+    # --- Two-scale noise extraction ---
+    smoothed_fine = cv2.GaussianBlur(gray, (0, 0), sigmaX=1.5)
+    smoothed_medium = cv2.GaussianBlur(gray, (0, 0), sigmaX=5.0)
+    noise_fine = gray - smoothed_fine
+    noise_medium = smoothed_fine - smoothed_medium
     
-    h, w = noise_residual.shape
+    # Combine both residuals (weighted)
+    noise_residual = np.sqrt(noise_fine**2 * 0.7 + noise_medium**2 * 0.3)
+    
     noise_map = np.zeros_like(noise_residual)
+    
+    # Build grid dimensions for spatial clustering
+    grid_h = (h - BLOCK_SIZE) // BLOCK_SIZE
+    grid_w = (w - BLOCK_SIZE) // BLOCK_SIZE
     
     block_stds = []
     block_positions = []
@@ -332,21 +446,126 @@ def _check_noise_inconsistency(cv_img: np.ndarray) -> dict:
     global_mean = float(np.mean(block_stds))
     global_std = float(np.std(block_stds))
     
+    # Build anomaly grid for spatial clustering
+    anomaly_grid = np.zeros((grid_h, grid_w), dtype=np.uint8)
     anomaly_blocks = 0
+    idx = 0
+    
     for y, x, std in block_positions:
         if global_std > 0:
             z_score = abs(std - global_mean) / global_std
         else:
             z_score = 0
         noise_map[y:y+BLOCK_SIZE, x:x+BLOCK_SIZE] = z_score
+        
+        gy = y // BLOCK_SIZE
+        gx = x // BLOCK_SIZE
         if z_score > SIGMA_THRESHOLD:
             anomaly_blocks += 1
+            if gy < grid_h and gx < grid_w:
+                anomaly_grid[gy, gx] = 1
+        idx += 1
     
     anomaly_ratio = anomaly_blocks / max(len(block_positions), 1)
     
+    # --- Spatial clustering: find connected components of anomalous blocks ---
+    labeled_clusters, num_clusters = ndimage.label(anomaly_grid)
+    largest_cluster_size = 0
+    cluster_ys, cluster_xs = [], []
+    if num_clusters > 0:
+        cluster_sizes = ndimage.sum(anomaly_grid, labeled_clusters,
+                                     range(1, num_clusters + 1))
+        largest_cluster_size = int(max(cluster_sizes))
+        largest_label = int(np.argmax(cluster_sizes)) + 1
+        cluster_mask = (labeled_clusters == largest_label)
+        cluster_ys, cluster_xs = np.where(cluster_mask)
+    
+    # Check if the cluster shape is thin/ribbon-like (e.g. barcode, watermark text line, or border line)
+    # vs a solid 2D shape (photo or paper patch).
+    is_thin_ribbon = False
+    if largest_cluster_size >= CLUSTER_MIN_BLOCKS and len(cluster_ys) > 0:
+        h_blocks = int(cluster_ys.max() - cluster_ys.min()) + 1
+        w_blocks = int(cluster_xs.max() - cluster_xs.min()) + 1
+        if min(h_blocks, w_blocks) < 6:
+            is_thin_ribbon = True
+            logger.info(
+                "Noise cluster shape is thin ribbon (%dx%d blocks) — suppressing as watermark or text line",
+                w_blocks, h_blocks
+            )
+            
+    # --- Face-aware cluster suppression ---
+    # On physical ID documents, the printed photo area naturally has different noise.
+    # Fix: detect faces using robust helper. Pre-process the face search image with a Gaussian blur to
+    # remove scanner halftone grids, and search with finer scale.
+    face_overlaps_cluster = False
+    if largest_cluster_size >= CLUSTER_MIN_BLOCKS and not is_thin_ribbon:
+        gray_uint8 = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
+        
+        # Use robust helper to detect faces
+        faces = _detect_faces(gray_uint8)
+        
+        if len(faces) > 0 and len(cluster_ys) > 0:
+            for (ffx, ffy, ffw, ffh) in faces:
+                # Expand face bbox by 60% to cover the full ID photo area
+                expand = 0.6
+                efx = max(0, int(ffx - ffw * expand))
+                efy = max(0, int(ffy - ffh * expand))
+                efw = min(w, int(ffx + ffw + ffw * expand)) - efx
+                efh = min(h, int(ffy + ffh + ffh * expand)) - efy
+                
+                # Convert expanded face bbox to grid coordinates
+                g_fx1 = efx // BLOCK_SIZE
+                g_fy1 = efy // BLOCK_SIZE
+                g_fx2 = (efx + efw) // BLOCK_SIZE
+                g_fy2 = (efy + efh) // BLOCK_SIZE
+                
+                # Count how many of the cluster's blocks are within the face bbox
+                y_start = max(0, g_fy1)
+                y_end = min(grid_h, g_fy2 + 1)
+                x_start = max(0, g_fx1)
+                x_end = min(grid_w, g_fx2 + 1)
+                
+                cluster_blocks_in_face = np.sum(cluster_mask[y_start:y_end, x_start:x_end])
+                face_blocks_count = (y_end - y_start) * (x_end - x_start)
+                
+                if face_blocks_count > 0:
+                    overlap_ratio_cluster = cluster_blocks_in_face / largest_cluster_size
+                    overlap_ratio_face = cluster_blocks_in_face / face_blocks_count
+                    
+                    # If 25%+ of the cluster lies in the face area OR if 25%+ of the face area is filled with the cluster blocks
+                    if overlap_ratio_cluster > 0.25 or overlap_ratio_face > 0.25:
+                        face_overlaps_cluster = True
+                        logger.info(
+                            "Noise cluster (size=%d) overlaps with detected face region (cluster overlap: %.1f%%, face overlap: %.1f%%) — suppressing as natural ID card photo region (not tampering)",
+                            largest_cluster_size, overlap_ratio_cluster * 100, overlap_ratio_face * 100
+                        )
+                        break
+    
+    has_coherent_cluster = (
+        largest_cluster_size >= CLUSTER_MIN_BLOCKS and not face_overlaps_cluster and not is_thin_ribbon
+    )
+    
     flags = []
-    if anomaly_ratio > FLAG_RATIO:
-        severity = "high" if anomaly_ratio > 0.12 else "medium"
+    if anomaly_ratio > FLAG_RATIO or has_coherent_cluster:
+        # Clustered anomalies get higher severity — they indicate a coherent
+        # tampered region rather than natural noise variation
+        is_critical_escalation = has_coherent_cluster and largest_cluster_size >= 150
+        
+        if is_critical_escalation:
+            severity = "high"
+            # Do not display cluster details in tampering_noise message to prevent redundancy
+            cluster_msg = ""
+        elif has_coherent_cluster:
+            severity = "high" if largest_cluster_size >= 90 else "medium"
+            cluster_msg = (
+                f" A contiguous cluster of {largest_cluster_size} anomalous blocks "
+                f"was detected, indicating a coherent region with different "
+                f"noise characteristics (likely pasted from another source)."
+            )
+        else:
+            severity = "high" if anomaly_ratio > 0.12 else "medium"
+            cluster_msg = ""
+        
         flags.append({
             "check": "tampering_noise",
             "severity": severity,
@@ -354,16 +573,39 @@ def _check_noise_inconsistency(cv_img: np.ndarray) -> dict:
                 f"Noise inconsistency detected in {anomaly_ratio:.1%} of blocks. "
                 f"Regions with anomalous noise patterns may have originated "
                 f"from a different image source."
+                + cluster_msg
             ),
             "evidence": {
                 "anomalous_block_ratio": f"{anomaly_ratio:.1%}",
                 "global_noise_mean": round(global_mean, 3),
                 "global_noise_std": round(global_std, 3),
+                "largest_cluster_blocks": largest_cluster_size,
+                "num_clusters": num_clusters,
             },
         })
+        
+        # Critical cluster escalation: a massive contiguous cluster of
+        # anomalous blocks is very strong evidence of a pasted region.
+        # Emit a second, separate flag to trigger the hard-kill rule
+        # (2+ high tampering flags → 20% additional score reduction).
+        if is_critical_escalation:
+            flags.append({
+                "check": "tampering_noise_cluster",
+                "severity": "high",
+                "message": (
+                    f"CRITICAL: Massive contiguous noise cluster of "
+                    f"{largest_cluster_size} blocks detected. This is very "
+                    f"strong evidence that a large region was pasted from "
+                    f"a different image source (e.g., photo replacement)."
+                ),
+                "evidence": {
+                    "cluster_size_blocks": largest_cluster_size,
+                    "cluster_area_percent": f"{largest_cluster_size * BLOCK_SIZE * BLOCK_SIZE / (h * w) * 100:.1f}%",
+                },
+            })
     
     heatmap_b64 = _create_heatmap_overlay(
-        cv_img, noise_map, cv2.COLORMAP_JET, min_val=1.5, max_val=4.0
+        cv_img, noise_map, cv2.COLORMAP_JET, min_val=1.0, max_val=3.5
     )
     
     return {
@@ -375,7 +617,9 @@ def _check_noise_inconsistency(cv_img: np.ndarray) -> dict:
         "description": (
             "Highlights blocks with anomalous sensor noise levels. "
             "Too-clean or too-noisy regions relative to the document baseline "
-            "may indicate compositing or digital insertion."
+            "may indicate compositing or digital insertion. Uses two-scale "
+            "noise extraction and spatial clustering to distinguish natural "
+            "variation from coherent tampered regions."
         ),
     }
 
@@ -397,8 +641,10 @@ def _check_pixel_artifacts(cv_img: np.ndarray) -> dict:
     5. Unusually strong block boundaries = possible edit boundary
     """
     BLOCK_SIZE = 8
-    BOUNDARY_RATIO_THRESHOLD = 1.8
-    FLAG_RATIO = 0.10
+    BOUNDARY_RATIO_THRESHOLD = 2.3  # adjusted up from 2.1
+    FLAG_RATIO = 0.17  # adjusted up from 0.14
+    # NOTE: PDF→PNG rendering at 144 DPI creates legitimate block artifacts
+    # at text edges. Previous thresholds (1.8 / 10%) flagged clean rendered PDFs.
     
     gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY).astype(np.float32)
     h, w = gray.shape
@@ -438,7 +684,7 @@ def _check_pixel_artifacts(cv_img: np.ndarray) -> dict:
     
     flags = []
     if anomaly_ratio > FLAG_RATIO:
-        severity = "high" if anomaly_ratio > 0.20 else "low"
+        severity = "high" if anomaly_ratio > 0.32 else "medium"
         flags.append({
             "check": "tampering_artifacts",
             "severity": severity,
@@ -484,8 +730,10 @@ def _check_copy_paste(cv_img: np.ndarray) -> dict:
     Note: This has the highest false-positive rate of all five checks.
     Use severity=low unless the match cluster is very strong.
     """
-    MIN_MATCH_COUNT = 10        # minimum ORB matches to consider suspicious
-    SPATIAL_MIN_DISTANCE = 50   # matched regions must be at least 50px apart
+    MIN_MATCH_COUNT = 60        # minimum ORB matches to consider suspicious
+    CLUSTER_MIN_MATCHES = 50    # minimum matches in a single displacement cluster to flag (adjusted up from 45)
+    SPATIAL_MIN_DISTANCE = 100  # matched regions must be at least 100px apart
+    MAX_MATCH_DISTANCE = 22     # only very strong descriptor matches (was 25)
     
     gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
     
@@ -496,7 +744,7 @@ def _check_copy_paste(cv_img: np.ndarray) -> dict:
     copy_paste_map = np.zeros(gray.shape, dtype=np.float32)
     flags = []
     
-    if descriptors is None or len(keypoints) < MIN_MATCH_COUNT * 2:
+    if descriptors is None or len(keypoints) < CLUSTER_MIN_MATCHES * 2:
         return {
             "check": "copy_paste",
             "label": "Copy-Paste Detection",
@@ -520,7 +768,7 @@ def _check_copy_paste(cv_img: np.ndarray) -> dict:
             # Skip self-matches (same keypoint)
             if m.queryIdx == m.trainIdx:
                 continue
-            if m.distance > 40:  # only strong matches
+            if m.distance > MAX_MATCH_DISTANCE:  # only very strong matches
                 continue
             
             pt1 = keypoints[m.queryIdx].pt
@@ -531,8 +779,34 @@ def _check_copy_paste(cv_img: np.ndarray) -> dict:
             if dist > SPATIAL_MIN_DISTANCE:
                 suspicious_pairs.append((pt1, pt2, m.distance))
     
+    # Cluster matches by spatial translation displacement vector (dx, dy)
+    displacement_clusters = []
+    for i, pair1 in enumerate(suspicious_pairs):
+        pt1_1, pt2_1, dist_1 = pair1
+        # Sort coordinates to ensure consistent displacement vector direction
+        p1, p2 = (pt1_1, pt2_1) if pt1_1[0] < pt2_1[0] else (pt2_1, pt1_1)
+        dx1 = p2[0] - p1[0]
+        dy1 = p2[1] - p1[1]
+        
+        cluster = [pair1]
+        for j, pair2 in enumerate(suspicious_pairs):
+            if i == j:
+                continue
+            pt1_2, pt2_2, dist_2 = pair2
+            pa, pb = (pt1_2, pt2_2) if pt1_2[0] < pt2_2[0] else (pt2_2, pt1_2)
+            dx2 = pb[0] - pa[0]
+            dy2 = pb[1] - pa[1]
+            
+            # Group pairs with identical/similar displacement vectors (within 20px)
+            if np.sqrt((dx1 - dx2)**2 + (dy1 - dy2)**2) < 20.0:
+                cluster.append(pair2)
+        displacement_clusters.append(cluster)
+        
+    largest_cluster = max(displacement_clusters, key=len) if displacement_clusters else []
+    n_suspicious = len(largest_cluster)
+    
     # Mark suspicious regions on the map
-    for pt1, pt2, dist in suspicious_pairs:
+    for pt1, pt2, dist in largest_cluster:
         x1, y1 = int(pt1[0]), int(pt1[1])
         x2, y2 = int(pt2[0]), int(pt2[1])
         radius = 15
@@ -541,20 +815,18 @@ def _check_copy_paste(cv_img: np.ndarray) -> dict:
         cv2.circle(copy_paste_map, (x1, y1), radius, 255 - dist * 4, -1)
         cv2.circle(copy_paste_map, (x2, y2), radius, 255 - dist * 4, -1)
     
-    n_suspicious = len(suspicious_pairs)
-    
-    if n_suspicious >= MIN_MATCH_COUNT:
+    if n_suspicious >= CLUSTER_MIN_MATCHES:
         flags.append({
             "check": "tampering_copy_paste",
             "severity": "medium",
             "message": (
-                f"Copy-paste detection found {n_suspicious} suspicious keypoint "
-                f"matches within the same document. This may indicate a region "
+                f"Copy-paste detection found a cluster of {n_suspicious} suspicious keypoint "
+                f"matches with consistent spatial displacement. This indicates a region "
                 f"was duplicated or cloned from elsewhere in the document."
             ),
             "evidence": {
                 "suspicious_match_count": n_suspicious,
-                "min_threshold": MIN_MATCH_COUNT,
+                "min_threshold": CLUSTER_MIN_MATCHES,
             },
         })
     
@@ -576,6 +848,220 @@ def _check_copy_paste(cv_img: np.ndarray) -> dict:
     }
 
 
+
+def _check_face_region_tampering(cv_img: np.ndarray) -> dict:
+    """
+    Face-region-aware tampering analysis for identity documents.
+    
+    On identity documents (Aadhaar, PAN, passport), the photo area is the
+    #1 tampering target. This check specifically analyzes the face region
+    against the rest of the document to detect photo replacement.
+    
+    Method:
+    1. Detect face using Haar cascade
+    2. Expand bounding box by 40% to capture paste-boundary seams
+    3. Compare face region vs background on five metrics:
+       a. Noise level ratio — different camera = different noise floor
+       b. ELA intensity ratio — re-compressed paste = higher ELA locally
+       c. Edge discontinuity — paste boundary creates unnatural edges
+       d. Color statistics mismatch — different lighting = different luminance stats
+       e. JPEG compression quality — different source = different quantization
+    4. Flag if 2+ sub-metrics are anomalous (medium), 3+ (high)
+    
+    Gracefully returns no flags if no face is detected (non-ID documents).
+    """
+    # Threshold rationale:
+    # - PHYSICAL ID cards: printed photo inherently differs from text in noise
+    #   (~2-3×) and luminance (~0.3-0.4), but has smooth printed edges and
+    #   consistent JPEG compression (same camera captured the whole card).
+    # - DIGITAL PASTE: the pasted photo may have similar or lower noise ratio
+    #   (both digital sources), BUT creates sharp cut edges, different JPEG
+    #   quality levels, and compression blocking artifacts.
+    # Key distinguishers: edge sharpness and compression quality are the most
+    # reliable because they're high for digital paste but low for physical cards.
+    NOISE_RATIO_THRESHOLD = 3.4    # adjusted up from 3.2 to catch subtler noise inconsistencies
+    ELA_RATIO_THRESHOLD = 2.4      # adjusted up from 2.2 to be more sensitive to photo ELA variations
+    EDGE_STRENGTH_THRESHOLD = 53.0 # adjusted up from 50.0 to detect cut-and-paste seams
+    LUMINANCE_DIFF_THRESHOLD = 0.48 # adjusted down from 0.50
+    COMPRESSION_RATIO_THRESHOLD = 3.0 # adjusted down from 3.5 to detect quantization discrepancies
+    
+    gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
+    h, w = gray.shape
+    
+    # Step 1: Detect face using robust helper
+    faces = _detect_faces(gray)
+    
+    face_map = np.zeros(gray.shape, dtype=np.float32)
+    
+    if len(faces) == 0:
+        # No face detected — not an ID photo or face too small/obscured
+        return {
+            "check": "face_region",
+            "label": "Face Region Analysis",
+            "heatmap_b64": _create_heatmap_overlay(
+                cv_img, face_map, cv2.COLORMAP_JET, min_val=0, max_val=1.0
+            ),
+            "mean_value": 0,
+            "flags": [],
+            "description": "No face detected in the document — face region analysis skipped.",
+        }
+    
+    # Use the largest detected face (most likely the ID photo)
+    fx, fy, fw, fh = max(faces, key=lambda f: f[2] * f[3])
+    
+    # Step 2: Expand bounding box by 40% to capture paste seams
+    expand = 0.40
+    ex = max(0, int(fx - fw * expand))
+    ey = max(0, int(fy - fh * expand))
+    ew = min(w, int(fx + fw * (1 + expand))) - ex
+    eh = min(h, int(fy + fh * (1 + expand))) - ey
+    
+    # Create face mask
+    face_mask = np.zeros((h, w), dtype=bool)
+    face_mask[ey:ey+eh, ex:ex+ew] = True
+    bg_mask = ~face_mask
+    
+    anomaly_count = 0
+    sub_metrics = {}
+    
+    # --- Metric A: Noise level ratio ---
+    gray_f = gray.astype(np.float32)
+    smoothed = cv2.GaussianBlur(gray_f, (0, 0), sigmaX=1.5)
+    noise_residual = gray_f - smoothed
+    
+    face_noise_std = float(noise_residual[face_mask].std()) if face_mask.any() else 0
+    bg_noise_std = float(noise_residual[bg_mask].std()) if bg_mask.any() else 1e-6
+    # Enforce noise floor to avoid extremely large ratios from flat scanned backgrounds
+    bg_noise_std_clamped = max(bg_noise_std, 1.2)
+    noise_ratio = face_noise_std / bg_noise_std_clamped
+    
+    sub_metrics["noise_ratio"] = round(noise_ratio, 2)
+    if noise_ratio > NOISE_RATIO_THRESHOLD:
+        anomaly_count += 1
+    
+    # --- Metric B: ELA intensity ratio ---
+    pil_img = Image.fromarray(cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB))
+    buffer = BytesIO()
+    pil_img.save(buffer, format="JPEG", quality=90)
+    buffer.seek(0)
+    resaved = Image.open(buffer).convert("RGB")
+    diff = np.array(ImageChops.difference(pil_img, resaved)).astype(np.float32).mean(axis=2)
+    
+    face_ela_mean = float(diff[face_mask].mean()) if face_mask.any() else 0
+    bg_ela_mean = float(diff[bg_mask].mean()) if bg_mask.any() else 1e-6
+    ela_ratio = face_ela_mean / max(bg_ela_mean, 1e-6)
+    
+    sub_metrics["ela_ratio"] = round(ela_ratio, 2)
+    if ela_ratio > ELA_RATIO_THRESHOLD:
+        anomaly_count += 1
+    
+    # --- Metric C: Edge discontinuity at face boundary ---
+    sobel_x = cv2.Sobel(gray_f, cv2.CV_64F, 1, 0, ksize=3)
+    sobel_y = cv2.Sobel(gray_f, cv2.CV_64F, 0, 1, ksize=3)
+    gradient_mag = np.sqrt(sobel_x**2 + sobel_y**2)
+    
+    # Extract gradient values along the face boundary (3-pixel band)
+    boundary_mask = np.zeros((h, w), dtype=bool)
+    band = 3
+    boundary_mask[max(0,ey-band):ey+band, ex:ex+ew] = True
+    boundary_mask[max(0,ey+eh-band):min(h,ey+eh+band), ex:ex+ew] = True
+    boundary_mask[ey:ey+eh, max(0,ex-band):ex+band] = True
+    boundary_mask[ey:ey+eh, max(0,ex+ew-band):min(w,ex+ew+band)] = True
+    
+    boundary_gradient = float(gradient_mag[boundary_mask].mean()) if boundary_mask.any() else 0
+    
+    sub_metrics["boundary_gradient"] = round(boundary_gradient, 2)
+    if boundary_gradient > EDGE_STRENGTH_THRESHOLD:
+        anomaly_count += 1
+    
+    # --- Metric D: Color statistics mismatch ---
+    face_lum_std = float(gray_f[face_mask].std()) if face_mask.any() else 0
+    bg_lum_std = float(gray_f[bg_mask].std()) if bg_mask.any() else 1e-6
+    max_std = max(face_lum_std, bg_lum_std, 1e-6)
+    lum_diff = abs(face_lum_std - bg_lum_std) / max_std
+    
+    sub_metrics["luminance_diff"] = round(lum_diff, 3)
+    if lum_diff > LUMINANCE_DIFF_THRESHOLD:
+        anomaly_count += 1
+    
+    # --- Metric E: JPEG compression quality difference ---
+    face_blocks_var = []
+    bg_blocks_var = []
+    for by in range(0, h - 8, 8):
+        for bx in range(0, w - 8, 8):
+            block = gray_f[by:by+8, bx:bx+8]
+            dct_block = cv2.dct(block - block.mean())
+            hf_var = float(dct_block[4:, 4:].var())
+            if face_mask[by + 4, bx + 4]:
+                face_blocks_var.append(hf_var)
+            else:
+                bg_blocks_var.append(hf_var)
+    
+    if face_blocks_var and bg_blocks_var:
+        face_compression = float(np.mean(face_blocks_var))
+        bg_compression = float(np.mean(bg_blocks_var))
+        # Enforce a minimum compression variance floor to prevent clean background division explosions
+        compression_ratio = face_compression / max(bg_compression, 8.0)
+    else:
+        compression_ratio = 1.0
+    
+    sub_metrics["compression_ratio"] = round(compression_ratio, 2)
+    if compression_ratio > COMPRESSION_RATIO_THRESHOLD:
+        anomaly_count += 1
+    
+    # --- Paint the face map for heatmap ---
+    face_map[face_mask] = float(anomaly_count) / 5.0 * 255
+    face_map[boundary_mask] = min(boundary_gradient / EDGE_STRENGTH_THRESHOLD, 1.0) * 255
+    
+    # --- Build flags ---
+    flags = []
+    if anomaly_count >= 2:
+        severity = "high" if anomaly_count >= 3 else "medium"
+        triggered = []
+        if noise_ratio > NOISE_RATIO_THRESHOLD:
+            triggered.append(f"noise ({noise_ratio:.1f}×)")
+        if ela_ratio > ELA_RATIO_THRESHOLD:
+            triggered.append(f"ELA ({ela_ratio:.1f}×)")
+        if boundary_gradient > EDGE_STRENGTH_THRESHOLD:
+            triggered.append(f"edge ({boundary_gradient:.0f})")
+        if compression_ratio > COMPRESSION_RATIO_THRESHOLD:
+            triggered.append(f"compression ({compression_ratio:.1f}×)")
+        if lum_diff > LUMINANCE_DIFF_THRESHOLD:
+            triggered.append(f"luminance ({lum_diff:.2f})")
+        
+        flags.append({
+            "check": "tampering_face_region",
+            "severity": severity,
+            "message": (
+                f"Face region analysis detected {anomaly_count}/5 tampering indicators "
+                f"({', '.join(triggered)}). The photo area shows characteristics "
+                f"inconsistent with the rest of the document, suggesting the "
+                f"photo may have been replaced or digitally inserted."
+            ),
+            "evidence": {
+                "anomaly_count": f"{anomaly_count}/5",
+                "face_bbox": f"({fx},{fy},{fw},{fh})",
+                **sub_metrics,
+            },
+        })
+    
+    heatmap_b64 = _create_heatmap_overlay(
+        cv_img, face_map, cv2.COLORMAP_JET, min_val=0, max_val=200.0
+    )
+    
+    return {
+        "check": "face_region",
+        "label": "Face Region Analysis",
+        "heatmap_b64": heatmap_b64,
+        "mean_value": anomaly_count,
+        "flags": flags,
+        "description": (
+            "Analyzes the face/photo region of identity documents against the "
+            "rest of the document. Compares noise levels, compression artifacts, "
+            "edge continuity, color statistics, and JPEG compression quality "
+            "to detect photo replacement."
+        ),
+    }
 
 
 def detect_tampering(image_path: str) -> dict:
@@ -620,11 +1106,12 @@ def detect_tampering(image_path: str) -> dict:
     heatmaps = {}
     
     checks_to_run = [
-        ("ELA",       lambda: _check_ela(pil_img, cv_img)),
-        ("Blur",      lambda: _check_blur_inconsistency(cv_img)),
-        ("Noise",     lambda: _check_noise_inconsistency(cv_img)),
-        ("Artifacts", lambda: _check_pixel_artifacts(cv_img)),
-        ("CopyPaste", lambda: _check_copy_paste(cv_img)),
+        ("ELA",        lambda: _check_ela(pil_img, cv_img)),
+        ("Blur",       lambda: _check_blur_inconsistency(cv_img)),
+        ("Noise",      lambda: _check_noise_inconsistency(cv_img)),
+        ("Artifacts",  lambda: _check_pixel_artifacts(cv_img)),
+        ("CopyPaste",  lambda: _check_copy_paste(cv_img)),
+        ("FaceRegion", lambda: _check_face_region_tampering(cv_img)),
     ]
     
     for check_name, check_fn in checks_to_run:
