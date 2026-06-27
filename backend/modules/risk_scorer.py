@@ -56,34 +56,34 @@ _FLAG_PENALTIES = {
     ("metadata_analysis", "low"):            3,
     ("financial_anomaly", "low"):            3,
 
-    # Visual Tampering Flags (moderated weightage to prevent genuine document false alarms while maintaining detection)
-    ("tampering_ela", "high"):               8,
-    ("tampering_ela", "medium"):             4,
-    ("tampering_ela", "low"):                2,
+    # Visual Tampering Flags (reduced weightage due to lower accuracy)
+    ("tampering_ela", "high"):               3,
+    ("tampering_ela", "medium"):             1,
+    ("tampering_ela", "low"):                1,
 
-    ("tampering_noise", "high"):             8,
-    ("tampering_noise", "medium"):           4,
-    ("tampering_noise", "low"):              2,
+    ("tampering_noise", "high"):             4,
+    ("tampering_noise", "medium"):           1,
+    ("tampering_noise", "low"):              1,
 
-    ("tampering_noise_cluster", "high"):     10,
-    ("tampering_noise_cluster", "medium"):   5,
-    ("tampering_noise_cluster", "low"):      2,
+    ("tampering_noise_cluster", "high"):     5,
+    ("tampering_noise_cluster", "medium"):   2,
+    ("tampering_noise_cluster", "low"):      1,
 
-    ("tampering_copy_paste", "high"):        8,
-    ("tampering_copy_paste", "medium"):      4,
-    ("tampering_copy_paste", "low"):         2,
+    ("tampering_copy_paste", "high"):        4,
+    ("tampering_copy_paste", "medium"):      2,
+    ("tampering_copy_paste", "low"):         1,
 
-    ("tampering_blur", "high"):              8,
-    ("tampering_blur", "medium"):            4,
-    ("tampering_blur", "low"):               2,
+    ("tampering_blur", "high"):              2,
+    ("tampering_blur", "medium"):            1,
+    ("tampering_blur", "low"):               1,
 
-    ("tampering_artifacts", "high"):         6,
-    ("tampering_artifacts", "medium"):       3,
-    ("tampering_artifacts", "low"):          2,
+    ("tampering_artifacts", "high"):         1,
+    ("tampering_artifacts", "medium"):       1,
+    ("tampering_artifacts", "low"):          1,
 
-    ("tampering_face_region", "high"):       10,
-    ("tampering_face_region", "medium"):     5,
-    ("tampering_face_region", "low"):        2,
+    ("tampering_face_region", "high"):       4,
+    ("tampering_face_region", "medium"):     2,
+    ("tampering_face_region", "low"):        1,
 }
 
 _FALLBACK_PENALTIES = {"high": 15, "medium": 8, "low": 3}
@@ -164,7 +164,6 @@ def calculate_trust_score(
     low_count = 0
 
     # Deduct penalties using check-specific lookup
-    deductions_breakdown = []
     for flag in all_flags:
         severity = flag.get("severity", "low").lower()
         check = flag.get("check", "unknown")
@@ -174,16 +173,8 @@ def calculate_trust_score(
             (check, severity),
             _FALLBACK_PENALTIES.get(severity, 3),
         )
-        base_score -= penalty
         flag["penalty"] = penalty
-
-        deductions_breakdown.append({
-            "check": check,
-            "severity": severity,
-            "message": flag.get("message", ""),
-            "penalty": penalty,
-            "type": "flag_penalty"
-        })
+        base_score -= penalty
 
         if severity == "high":
             high_count += 1
@@ -194,6 +185,7 @@ def calculate_trust_score(
 
     # Floor at 0
     trust_score = max(0, base_score)
+    base_deductions = 100 - trust_score
 
     # --- Hard-kill rules ---
 
@@ -204,40 +196,24 @@ def calculate_trust_score(
         for f in all_flags
         if f.get("severity") == "high"
     )
-    score_before_cap = trust_score
+    
+    score_after_deductions = trust_score
     if has_hard_kill:
         trust_score = min(trust_score, 20)
-    
-    cap_reduction = score_before_cap - trust_score
-    if cap_reduction > 0:
-        deductions_breakdown.append({
-            "check": "hard_kill_cap",
-            "severity": "high",
-            "message": "Critical fraud indicator (identity/property mismatch) capped score at 20",
-            "penalty": cap_reduction,
-            "type": "hard_kill_cap"
-        })
+    hard_kill_reduction = score_after_deductions - trust_score
 
     # Hard kill rule 2: 2+ high-severity tampering flags →
-    # apply 3% additional reduction (reverted from 5% to soften impact on genuine scans)
+    # apply 3% additional reduction (further softened from 10% to prevent excessive penalty due to visual tampering inaccuracies)
     high_tampering = sum(
         1 for f in all_flags
         if f.get("check", "").startswith("tampering_")
         and f.get("severity") == "high"
     )
-    score_before_tamper = trust_score
+    
+    score_before_tampering = trust_score
     if high_tampering >= 2:
         trust_score = int(trust_score * 0.97)
-    
-    tamper_reduction = score_before_tamper - trust_score
-    if tamper_reduction > 0:
-        deductions_breakdown.append({
-            "check": "tampering_multiplier",
-            "severity": "high",
-            "message": "Multiple high-severity tampering flags (3% additional reduction)",
-            "penalty": tamper_reduction,
-            "type": "tampering_multiplier"
-        })
+    tampering_reduction = score_before_tampering - trust_score
 
     hard_kill_triggered = has_hard_kill  # track for frontend banner
 
@@ -271,5 +247,7 @@ def calculate_trust_score(
         "low_count": low_count,
         "all_flags": all_flags,
         "hard_kill_triggered": hard_kill_triggered,
-        "deductions_breakdown": deductions_breakdown,
+        "base_deductions": base_deductions,
+        "hard_kill_reduction": hard_kill_reduction,
+        "tampering_reduction": tampering_reduction,
     }

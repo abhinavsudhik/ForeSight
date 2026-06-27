@@ -19,8 +19,13 @@ import sys
 # Force HuggingFace libraries and tokenizers to run in offline mode.
 # This prevents network calls to huggingface.co for already downloaded models.
 # ---------------------------------------------------------------------------
-os.environ["HF_HUB_OFFLINE"] = "1"
-os.environ["TRANSFORMERS_OFFLINE"] = "1"
+if os.environ.get("FORESIGHT_ONLINE") == "1":
+    os.environ["HF_HUB_OFFLINE"] = "0"
+    os.environ["TRANSFORMERS_OFFLINE"] = "0"
+else:
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
 
 import uuid
 import tempfile
@@ -59,7 +64,7 @@ logger = logging.getLogger(__name__)
 # ═══════════════════════════════════════════════════════════════════════════
 st.set_page_config(
     page_title="ForeSight — Document Fraud Detection",
-    page_icon="🟢",
+    page_icon=None,
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -352,17 +357,36 @@ def _severity_color(severity: str) -> str:
     return {
         "high": "#dc3545",
         "medium": "#faad14",
-        "low": "#3fb950",
+        "low": "#e6edf3",
     }.get(severity.lower(), "#8b949e")
 
 
-def _severity_emoji(severity: str) -> str:
-    """Map severity to a coloured emoji."""
-    return {
-        "high": "🔴",
-        "medium": "�",
-        "low": "🟢",
-    }.get(severity.lower(), "🟢")
+def _severity_label_md(severity: str) -> str:
+    """Map severity to professional colored text in Markdown."""
+    sev = severity.lower()
+    if sev == "high":
+        return ":red[[HIGH SEVERITY]]"
+    elif sev == "medium":
+        return ":orange[[MEDIUM SEVERITY]]"
+    elif sev == "low":
+        return ":gray[[LOW SEVERITY]]"
+    elif sev == "accepted":
+        return ":green[[ACCEPTED]]"
+    return f"[{severity.upper()}]"
+
+
+def _severity_label_html(severity: str) -> str:
+    """Map severity to professional colored text in HTML."""
+    sev = severity.lower()
+    if sev == "high":
+        return "<span style='color: #dc3545; font-weight: bold;'>[HIGH SEVERITY]</span>"
+    elif sev == "medium":
+        return "<span style='color: #faad14; font-weight: bold;'>[MEDIUM SEVERITY]</span>"
+    elif sev == "low":
+        return "<span style='color: #e6edf3; font-weight: bold;'>[LOW SEVERITY]</span>"
+    elif sev == "accepted":
+        return "<span style='color: #3fb950; font-weight: bold;'>[ACCEPTED]</span>"
+    return f"<span style='color: #8b949e; font-weight: bold;'>[{severity.upper()}]</span>"
 
 
 def _risk_badge_color(color: str) -> str:
@@ -409,7 +433,7 @@ def _run_pipeline(uploaded_files) -> dict:
 
     total_steps = len(uploaded_files) * 3 + 5  # OCR+Classify+Extract per file, + cross/meta/tamper/fin/score
     current_step = 0
-    progress = st.progress(0, text="Starting analysis…")
+    progress = st.progress(0, text="Starting analysis...")
 
     # ------------------------------------------------------------------
     # Phase 1 — Per-document processing
@@ -429,7 +453,7 @@ def _run_pipeline(uploaded_files) -> dict:
         current_step += 1
         progress.progress(
             current_step / total_steps,
-            text=f"Running OCR on {filename}…",
+            text=f"Running OCR on {filename}...",
         )
         try:
             ocr_result: OCRResult = extract_text(tmp_path)
@@ -437,14 +461,14 @@ def _run_pipeline(uploaded_files) -> dict:
 
             if ocr_result.status == "failed":
                 st.error(
-                    f"🔴 **{filename}**: OCR was unable to extract text from this document.  \n"
+                    f"**{filename}**: OCR was unable to extract text from this document.  \n"
                     f"This is likely due to a noisy, blurry, or low-quality scan. "
                     f"Please try uploading a clearer copy of the document.  \n"
                     f"{'  \\n'.join(ocr_result.diagnostics)}"
                 )
             elif ocr_result.status == "partial":
                 st.warning(
-                    f"� **{filename}**: OCR partially succeeded — "
+                    f"**{filename}**: OCR partially succeeded — "
                     f"{ocr_result.pages_succeeded}/{ocr_result.pages_total} pages "
                     f"processed ({ocr_result.total_chars} chars).  \n"
                     f"{'  \n'.join(ocr_result.diagnostics)}"
@@ -455,7 +479,7 @@ def _run_pipeline(uploaded_files) -> dict:
                     filename, ocr_result.total_chars, ocr_result.elapsed_seconds,
                 )
         except (FileNotFoundError, ValueError) as exc:
-            st.error(f"🔴 **{filename}**: {exc}")
+            st.error(f"**{filename}**: {exc}")
             raw_text = ""
             ocr_result = OCRResult(status="failed", diagnostics=[str(exc)])
         except Exception as exc:
@@ -467,7 +491,7 @@ def _run_pipeline(uploaded_files) -> dict:
         current_step += 1
         progress.progress(
             current_step / total_steps,
-            text=f"Classifying {filename}…",
+            text=f"Classifying {filename}...",
         )
         classification = classify_document(raw_text)
 
@@ -475,11 +499,11 @@ def _run_pipeline(uploaded_files) -> dict:
         current_step += 1
         progress.progress(
             current_step / total_steps,
-            text=f"Extracting fields from {filename}…",
+            text=f"Extracting fields from {filename}...",
         )
         if classification.label == "unknown":
             st.warning(
-                f"� **{filename}**: Could not determine document type "
+                f"**{filename}**: Could not determine document type "
                 f"(no keyword matches). Skipping field extraction."
             )
             doc_record = {
@@ -512,7 +536,7 @@ def _run_pipeline(uploaded_files) -> dict:
                     "ocr_method": ocr_result.method,
                 }
             except ValueError as exc:
-                st.warning(f"� **{filename}**: Field extraction failed — {exc}")
+                st.warning(f"**{filename}**: Field extraction failed — {exc}")
                 doc_record = {
                     "filename": filename,
                     "tmp_path": tmp_path,
@@ -534,7 +558,7 @@ def _run_pipeline(uploaded_files) -> dict:
     current_step += 1
     progress.progress(
         current_step / total_steps,
-        text="Running cross-document checks…",
+        text="Running cross-document checks...",
     )
     cross_doc_flags = cross_validate(documents)
 
@@ -544,7 +568,7 @@ def _run_pipeline(uploaded_files) -> dict:
     current_step += 1
     progress.progress(
         current_step / total_steps,
-        text="Analysing PDF metadata…",
+        text="Analysing PDF metadata...",
     )
     all_metadata_flags: list[dict] = []
     for doc in documents:
@@ -568,7 +592,7 @@ def _run_pipeline(uploaded_files) -> dict:
     current_step += 1
     progress.progress(
         current_step / total_steps,
-        text="Running visual tampering analysis…",
+        text="Running visual tampering analysis...",
     )
     all_tampering_results = []
     for doc in documents:
@@ -592,7 +616,7 @@ def _run_pipeline(uploaded_files) -> dict:
     current_step += 1
     progress.progress(
         current_step / total_steps,
-        text="Detecting financial anomalies…",
+        text="Detecting financial anomalies...",
     )
     financial_flags: list[dict] = []
     for doc in documents:
@@ -616,7 +640,7 @@ def _run_pipeline(uploaded_files) -> dict:
 
     progress.progress(
         current_step / total_steps,
-        text="Calculating trust score…",
+        text="Calculating trust score...",
     )
     
     score_result = calculate_trust_score(
@@ -627,7 +651,7 @@ def _run_pipeline(uploaded_files) -> dict:
     )
     recommendation = generate_recommendation(score_result)
 
-    progress.progress(1.0, text="🟢 Analysis complete!")
+    progress.progress(1.0, text="Analysis complete!")
 
     return {
         "case_id": case_id,
@@ -715,7 +739,7 @@ def _render_tab_case_overview(results: dict):
         <div style="background: rgba(220,53,69,0.12); border: 1px solid #dc3545;
                     border-radius: 6px; padding: 1rem 1.25rem; margin-top: 1rem;">
             <p style="color: #dc3545; font-weight: 700; margin: 0; font-size: 0.9rem;">
-                🔴 HARD KILL RULE TRIGGERED
+                HARD KILL RULE TRIGGERED
             </p>
             <p style="color: #e6edf3; margin: 0.4rem 0 0 0; font-size: 0.85rem;">
                 A critical fraud indicator (identity or property mismatch) was
@@ -730,65 +754,31 @@ def _render_tab_case_overview(results: dict):
     with col_h:
         st.markdown(f"""
         <div class="info-card" style="text-align: center; border-left: 3px solid #dc3545;">
-            <h4>🔴 High</h4>
+            <h4>High Severity</h4>
             <p>{score['high_count']}</p>
         </div>
         """, unsafe_allow_html=True)
     with col_m:
         st.markdown(f"""
         <div class="info-card" style="text-align: center; border-left: 3px solid #faad14;">
-            <h4>� Medium</h4>
+            <h4>Medium Severity</h4>
             <p>{score['medium_count']}</p>
         </div>
         """, unsafe_allow_html=True)
     with col_l:
         st.markdown(f"""
-        <div class="info-card" style="text-align: center; border-left: 3px solid #3fb950;">
-            <h4>🟢 Low</h4>
+        <div class="info-card" style="text-align: center; border-left: 3px solid #e6edf3;">
+            <h4>Low Severity</h4>
             <p>{score['low_count']}</p>
         </div>
         """, unsafe_allow_html=True)
     with col_t:
         st.markdown(f"""
         <div class="info-card" style="text-align: center; border-left: 3px solid #00e5ff;">
-            <h4>Total</h4>
+            <h4>Total Flags</h4>
             <p>{score['total_flags']}</p>
         </div>
         """, unsafe_allow_html=True)
-
-    # ── Score deductions breakdown ──
-    st.markdown("<div style='height: 1.5rem'></div>", unsafe_allow_html=True)
-    st.markdown("#### Score Deductions Breakdown")
-    deductions = score.get("deductions_breakdown", [])
-    if not deductions:
-        st.success("🟢 No score deductions — all checks passed successfully.")
-    else:
-        table_rows = []
-        for d in deductions:
-            sev = d.get("severity", "low").lower()
-            if sev == "high":
-                sev_display = "🔴 High"
-            elif sev == "medium":
-                sev_display = "� Medium"
-            else:
-                sev_display = "🟢 Low"
-            
-            check_name = d.get("check", "unknown").replace("_", " ").title()
-            if d.get("type") == "hard_kill_cap":
-                check_name = "Critical Fraud Indicator Cap"
-            elif d.get("type") == "tampering_multiplier":
-                check_name = "Visual Tampering Multiplier"
-
-            penalty_display = f"-{d['penalty']} pts"
-            message = d.get("message", "")
-            
-            table_rows.append({
-                "Check / Factor": check_name,
-                "Severity": sev_display,
-                "Score Deduction": penalty_display,
-                "Details": message
-            })
-        st.table(table_rows)
 
     # ── Documents processed ──
     st.markdown("<div style='height: 1rem'></div>", unsafe_allow_html=True)
@@ -797,13 +787,88 @@ def _render_tab_case_overview(results: dict):
         label = doc["document_type"].replace("_", " ").title()
         confidence = doc.get("classification_confidence", 0)
         ocr_status = doc.get("ocr_status", "success")
-        ocr_badge = {"success": "🟢", "partial": "�", "failed": "🔴"}.get(ocr_status, "🔴")
+        ocr_badge = {
+            "success": _severity_label_md("accepted"),
+            "partial": _severity_label_md("medium"),
+            "failed": _severity_label_md("high"),
+        }.get(ocr_status, f"[{ocr_status.upper()}]")
         st.markdown(
             f"- {ocr_badge} **{doc['filename']}** → `{label}` "
             f"(confidence: {confidence:.0%}, "
             f"{doc['fields_found']} fields extracted, "
             f"OCR: {ocr_status})"
         )
+
+    # ── Score Impact Breakdown ──
+    st.markdown("<div style='height: 1.5rem'></div>", unsafe_allow_html=True)
+    st.markdown("#### Score Impact Breakdown")
+    
+    breakdown_rows = ""
+    # Base Score
+    breakdown_rows += (
+        "<tr>"
+        "<td style='padding: 0.5rem 1rem; border-bottom: 1px solid var(--border); font-size: 0.9rem;'>Base Score</td>"
+        f"<td style='padding: 0.5rem 1rem; border-bottom: 1px solid var(--border); font-size: 0.9rem;'>{_severity_label_html('accepted')}</td>"
+        "<td style='padding: 0.5rem 1rem; border-bottom: 1px solid var(--border); color:#3fb950; font-weight:bold; font-family:monospace; font-size: 0.9rem;'>+100</td>"
+        "</tr>"
+    )
+    
+    for flag in score.get("all_flags", []):
+        check_name = flag.get("check", "unknown").replace("_", " ").title()
+        severity = flag.get("severity", "low")
+        penalty = flag.get("penalty", 0)
+        msg = flag.get("message", "")
+        if penalty > 0:
+            breakdown_rows += (
+                "<tr>"
+                f"<td style='padding: 0.5rem 1rem; border-bottom: 1px solid var(--border); font-size: 0.9rem;'>Deduction: {check_name}<br><small style='color:#8b949e;'>{msg}</small></td>"
+                f"<td style='padding: 0.5rem 1rem; border-bottom: 1px solid var(--border); font-size: 0.9rem;'>{_severity_label_html(severity)}</td>"
+                f"<td style='padding: 0.5rem 1rem; border-bottom: 1px solid var(--border); color:#dc3545; font-weight:bold; font-family:monospace; font-size: 0.9rem;'>-{penalty}</td>"
+                "</tr>"
+            )
+            
+    if score.get("hard_kill_reduction", 0) > 0:
+        breakdown_rows += (
+            "<tr>"
+            "<td style='padding: 0.5rem 1rem; border-bottom: 1px solid var(--border); font-size: 0.9rem;'>Capped score adjustment (Critical Identity/Property Mismatch)</td>"
+            f"<td style='padding: 0.5rem 1rem; border-bottom: 1px solid var(--border); font-size: 0.9rem;'>{_severity_label_html('high')}</td>"
+            f"<td style='padding: 0.5rem 1rem; border-bottom: 1px solid var(--border); color:#dc3545; font-weight:bold; font-family:monospace; font-size: 0.9rem;'>-{score['hard_kill_reduction']}</td>"
+            "</tr>"
+        )
+        
+    if score.get("tampering_reduction", 0) > 0:
+        breakdown_rows += (
+            "<tr>"
+            "<td style='padding: 0.5rem 1rem; border-bottom: 1px solid var(--border); font-size: 0.9rem;'>Compounding Tampering safety factor (2+ visual tampering indicators)</td>"
+            f"<td style='padding: 0.5rem 1rem; border-bottom: 1px solid var(--border); font-size: 0.9rem;'>{_severity_label_html('high')}</td>"
+            f"<td style='padding: 0.5rem 1rem; border-bottom: 1px solid var(--border); color:#dc3545; font-weight:bold; font-family:monospace; font-size: 0.9rem;'>-{score['tampering_reduction']}</td>"
+            "</tr>"
+        )
+        
+    # Final Trust Score Row
+    final_color = _risk_badge_color(score["color"])
+    breakdown_rows += (
+        "<tr style='background: rgba(255,255,255,0.02); font-weight:bold; border-top: 2px solid var(--border);'>"
+        "<td style='padding: 0.5rem 1rem; border-bottom: 1px solid var(--border); font-size: 0.9rem;'>Final Trust Score</td>"
+        "<td style='padding: 0.5rem 1rem; border-bottom: 1px solid var(--border); font-size: 0.9rem;'>—</td>"
+        f"<td style='padding: 0.5rem 1rem; border-bottom: 1px solid var(--border); color:{final_color}; font-size:1.15rem; font-family:monospace;'>{score['trust_score']}</td>"
+        "</tr>"
+    )
+    
+    st.markdown(f"""
+    <table style="width:100%; border-collapse:collapse; margin-top:0.5rem; border: 1px solid var(--border);">
+        <thead>
+            <tr style="border-bottom: 2px solid var(--border); text-align:left; background: rgba(255,255,255,0.02);">
+                <th style="padding:0.5rem 1rem; color:var(--text-secondary); font-size:0.75rem; text-transform:uppercase; letter-spacing:1px;">Pattern / Indicator</th>
+                <th style="padding:0.5rem 1rem; color:var(--text-secondary); font-size:0.75rem; text-transform:uppercase; letter-spacing:1px;">Severity</th>
+                <th style="padding:0.5rem 1rem; color:var(--text-secondary); font-size:0.75rem; text-transform:uppercase; letter-spacing:1px;">Impact</th>
+            </tr>
+        </thead>
+        <tbody>
+            {breakdown_rows}
+        </tbody>
+    </table>
+    """, unsafe_allow_html=True)
 
 
 def _render_tab_extracted_data(results: dict):
@@ -822,14 +887,14 @@ def _render_tab_extracted_data(results: dict):
         ocr_status = doc.get("ocr_status", "success")
         if ocr_status == "failed":
             st.error(
-                f"🔴 **OCR failed** — unable to extract text from this document. "
+                f"**OCR failed** — unable to extract text from this document. "
                 f"This is likely due to a noisy, blurry, or low-quality scan. "
                 f"Please try uploading a clearer copy.  \n"
                 + "  \n".join(doc.get("ocr_diagnostics", []))
             )
         elif ocr_status == "partial":
             st.warning(
-                f"� **Partial OCR** — some pages could not be processed.  \n"
+                f"**Partial OCR** — some pages could not be processed.  \n"
                 + "  \n".join(doc.get("ocr_diagnostics", []))
             )
 
@@ -854,11 +919,11 @@ def _render_tab_extracted_data(results: dict):
 
         if missing:
             st.caption(
-                f"🟢 {found}/{total} fields extracted  ·  "
-                f"🔴 Missing: {', '.join(m.replace('_', ' ').title() for m in missing)}"
+                f"{_severity_label_md('accepted')} {found}/{total} fields extracted  ·  "
+                f"{_severity_label_md('high')} Missing: {', '.join(m.replace('_', ' ').title() for m in missing)}"
             )
         else:
-            st.caption(f"🟢 All {total} fields extracted successfully")
+            st.caption(f"{_severity_label_md('accepted')} All {total} fields extracted successfully")
 
         st.divider()
 
@@ -899,32 +964,30 @@ def _render_tab_tampering(results: dict):
             continue
         
         # Render each check's heatmap in a grid
-        cols_per_row = 3
-        for r in range(0, len(checks), cols_per_row):
-            row_checks = checks[r:r + cols_per_row]
-            cols = st.columns(cols_per_row)
-            for i, check in enumerate(row_checks):
-                with cols[i]:
-                    st.markdown(f"**{check['label']}**")
-                    heatmap = check.get("heatmap_b64")
-                    if heatmap:
-                        st.image(
-                            f"data:image/png;base64,{heatmap}",
-                            width='stretch',
-                        )
+        cols = st.columns(min(len(checks), 3))
+        for i, check in enumerate(checks):
+            col = cols[i % 3]
+            with col:
+                st.markdown(f"**{check['label']}**")
+                heatmap = check.get("heatmap_b64")
+                if heatmap:
+                    st.image(
+                        f"data:image/png;base64,{heatmap}",
+                        width=300,
+                    )
+                else:
+                    st.caption("No heatmap available.")
+                st.caption(check.get("description", ""))
+                
+                flags = check.get("flags", [])
+                for flag in flags:
+                    sev = flag.get("severity", "low")
+                    if sev == "high":
+                        st.error(f"{_severity_label_md('high')} {flag['message']}")
+                    elif sev == "medium":
+                        st.warning(f"{_severity_label_md('medium')} {flag['message']}")
                     else:
-                        st.caption("No heatmap available.")
-                    st.caption(check.get("description", ""))
-                    
-                    flags = check.get("flags", [])
-                    for flag in flags:
-                        sev = flag.get("severity", "low")
-                        if sev == "high":
-                            st.error(f"🔴 {flag['message']}")
-                        elif sev == "medium":
-                            st.warning(f"� {flag['message']}")
-                        else:
-                            st.info(f"🟢 {flag['message']}")
+                        st.info(f"{_severity_label_md('low')} {flag['message']}")
         
         st.divider()
 
@@ -936,7 +999,7 @@ def _render_tab_cross_doc_flags(results: dict):
     cross_doc_flags = results["cross_doc_flags"]
 
     if not cross_doc_flags:
-        st.success("🟢 No cross-document inconsistencies detected — all documents are consistent.")
+        st.success("No cross-document inconsistencies detected — all documents are consistent.")
         return
 
     st.markdown(f"### {len(cross_doc_flags)} Inconsistency Flag(s) Detected")
@@ -953,13 +1016,12 @@ def _render_tab_cross_doc_flags(results: dict):
         check = flag_dict.get("check", "unknown")
         message = flag_dict.get("message", "")
         evidence = flag_dict.get("evidence", {})
-        emoji = _severity_emoji(severity)
         color = _severity_color(severity)
 
         check_title = check.replace("_", " ").title()
 
         with st.expander(
-            f"{emoji} {check_title} — **{severity.upper()}**",
+            f"{_severity_label_md(severity)} {check_title}",
             expanded=(severity == "high"),
         ):
             st.markdown(f"<p style='color: {color}; font-weight: 600;'>{message}</p>",
@@ -1012,15 +1074,14 @@ def _render_tab_metadata(results: dict):
             for flag in flags:
                 severity = flag.get("severity", "low")
                 msg = flag.get("message", "")
-                emoji = _severity_emoji(severity)
                 if severity == "high":
-                    st.error(f"{emoji} {msg}")
+                    st.error(f"{_severity_label_md('high')} {msg}")
                 elif severity == "medium":
-                    st.warning(f"{emoji} {msg}")
+                    st.warning(f"{_severity_label_md('medium')} {msg}")
                 else:
-                    st.info(f"{emoji} {msg}")
+                    st.info(f"{_severity_label_md('low')} {msg}")
         else:
-            st.success("🟢 No suspicious metadata patterns detected.")
+            st.success("No suspicious metadata patterns detected.")
 
         st.divider()
 
@@ -1037,7 +1098,7 @@ def _render_tab_financial(results: dict):
     data_quality = financial_result.get("data_quality", "ok")
     if data_quality == "insufficient_for_monthly_analysis":
         st.warning(
-            "� Only aggregate totals were extracted from the bank statement — "
+            "Only aggregate totals were extracted from the bank statement — "
             "per-month anomaly analysis requires at least 3 months of data. "
             "Upload a multi-month bank statement for full analysis."
         )
@@ -1105,7 +1166,7 @@ def _render_tab_financial(results: dict):
             x=anomaly_months,
             y=anomaly_values,
             mode="markers",
-            name="🔴 Anomaly",
+            name="Anomaly",
             marker=dict(
                 size=14,
                 color="#dc3545",
@@ -1135,15 +1196,14 @@ def _render_tab_financial(results: dict):
         for flag in flags:
             severity = flag.get("severity", "low")
             msg = flag.get("message", "")
-            emoji = _severity_emoji(severity)
             if severity == "high":
-                st.error(f"{emoji} {msg}")
+                st.error(f"{_severity_label_md('high')} {msg}")
             elif severity == "medium":
-                st.warning(f"{emoji} {msg}")
+                st.warning(f"{_severity_label_md('medium')} {msg}")
             else:
-                st.info(f"{emoji} {msg}")
+                st.info(f"{_severity_label_md('low')} {msg}")
     else:
-        st.success("🟢 No financial anomalies detected.")
+        st.success("No financial anomalies detected.")
 
 
 def _render_tab_recommendation(results: dict):
@@ -1176,11 +1236,10 @@ def _render_tab_recommendation(results: dict):
 
         for card in evidence_cards:
             severity = card.get("severity", "low")
-            emoji = _severity_emoji(severity)
             color = _severity_color(severity)
 
             with st.expander(
-                f"{emoji} {card['issue']}",
+                f"{_severity_label_md(severity)} {card['issue']}",
                 expanded=(severity == "high"),
             ):
                 st.markdown(f"**Severity:** "
@@ -1191,7 +1250,7 @@ def _render_tab_recommendation(results: dict):
                 st.markdown("**Evidence:**")
                 st.json(card["evidence"])
     else:
-        st.success("🟢 No issues to report — the application looks clean.")
+        st.success("No issues to report — the application looks clean.")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1203,7 +1262,7 @@ with st.sidebar:
     <div style="text-align: center; padding: 1.5rem 0;">
         <p style="font-size: 1.5rem; font-weight: 700; margin: 0;
                   color: #00e5ff; letter-spacing: -0.5px;">
-            🟢 ForeSight
+            ForeSight
         </p>
         <p style="font-size: 0.75rem; color: #8b949e; margin-top: 0.25rem;
                   text-transform: uppercase; letter-spacing: 2px;">
@@ -1282,7 +1341,7 @@ if "results" not in st.session_state:
     with col1:
         st.markdown("""
         <div class="info-card" style="text-align: center;">
-            <p style="font-size: 1.5rem; margin-bottom: 0.5rem;">🟢</p>
+            <div style="height: 1rem;"></div>
             <h4 style="font-size: 0.8rem !important; color: #e6edf3 !important;">Upload</h4>
             <p style="font-size: 0.78rem !important; color: #8b949e !important; font-weight: 400 !important;">
                 PDFs or images — identity proofs, land records, sale deeds, bank statements
@@ -1292,7 +1351,7 @@ if "results" not in st.session_state:
     with col2:
         st.markdown("""
         <div class="info-card" style="text-align: center;">
-            <p style="font-size: 1.5rem; margin-bottom: 0.5rem;">�</p>
+            <div style="height: 1rem;"></div>
             <h4 style="font-size: 0.8rem !important; color: #e6edf3 !important;">Analyze</h4>
             <p style="font-size: 0.78rem !important; color: #8b949e !important; font-weight: 400 !important;">
                 OCR, field extraction, cross-document validation, metadata & financial checks
@@ -1302,7 +1361,7 @@ if "results" not in st.session_state:
     with col3:
         st.markdown("""
         <div class="info-card" style="text-align: center;">
-            <p style="font-size: 1.5rem; margin-bottom: 0.5rem;">🔴</p>
+            <div style="height: 1rem;"></div>
             <h4 style="font-size: 0.8rem !important; color: #e6edf3 !important;">Assess</h4>
             <p style="font-size: 0.78rem !important; color: #8b949e !important; font-weight: 400 !important;">
                 Trust score, risk classification, and actionable underwriter recommendations

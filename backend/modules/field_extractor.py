@@ -19,9 +19,13 @@ Extraction approach (three layers — QA Model → Regex → spaCy NER):
                      and addresses (GPE, LOC) that regex missed.
 """
 import os
-# Force offline mode for HuggingFace hub
-os.environ["HF_HUB_OFFLINE"] = "1"
-os.environ["TRANSFORMERS_OFFLINE"] = "1"
+if os.environ.get("FORESIGHT_ONLINE") == "1":
+    os.environ["HF_HUB_OFFLINE"] = "0"
+    os.environ["TRANSFORMERS_OFFLINE"] = "0"
+else:
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
 
 import re
 import logging
@@ -1074,7 +1078,7 @@ def _get_qa_pipeline():
         import torch
         from transformers import pipeline as hf_pipeline
 
-        device = "mps" if torch.backends.mps.is_available() else "cpu"
+        device = os.environ.get("TORCH_DEVICE", "mps" if torch.backends.mps.is_available() else "cpu")
         logger.info(
             "Loading QA model (deepset/roberta-base-squad2) on device '%s' …", device
         )

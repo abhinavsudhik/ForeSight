@@ -895,16 +895,7 @@ def _check_face_region_tampering(cv_img: np.ndarray) -> dict:
     
     if len(faces) == 0:
         # No face detected — not an ID photo or face too small/obscured
-        return {
-            "check": "face_region",
-            "label": "Face Region Analysis",
-            "heatmap_b64": _create_heatmap_overlay(
-                cv_img, face_map, cv2.COLORMAP_JET, min_val=0, max_val=1.0
-            ),
-            "mean_value": 0,
-            "flags": [],
-            "description": "No face detected in the document — face region analysis skipped.",
-        }
+        return None
     
     # Use the largest detected face (most likely the ID photo)
     fx, fy, fw, fh = max(faces, key=lambda f: f[2] * f[3])
@@ -1117,6 +1108,9 @@ def detect_tampering(image_path: str) -> dict:
     for check_name, check_fn in checks_to_run:
         try:
             result = check_fn()
+            if result is None:
+                logger.info("%s check: skipped (no face detected/applicable context)", check_name)
+                continue
             results.append(result)
             all_flags.extend(result.get("flags", []))
             if result.get("heatmap_b64"):

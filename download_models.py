@@ -28,10 +28,10 @@ def main():
     try:
         from sentence_transformers import CrossEncoder
         model = CrossEncoder("cross-encoder/nli-MiniLM2-L6-H768")
-        print("  ✅ CrossEncoder NLI model downloaded and cached.")
+        print("  [SUCCESS] CrossEncoder NLI model downloaded and cached.")
         del model
     except Exception as exc:
-        print(f"  ❌ Failed: {exc}", file=sys.stderr)
+        print(f"  [FAILED] Failed: {exc}", file=sys.stderr)
         sys.exit(1)
 
     # ------------------------------------------------------------------
@@ -41,10 +41,10 @@ def main():
     try:
         from transformers import pipeline as hf_pipeline
         qa = hf_pipeline("question-answering", model="deepset/roberta-base-squad2")
-        print("  ✅ RoBERTa QA model downloaded and cached.")
+        print("  [SUCCESS] RoBERTa QA model downloaded and cached.")
         del qa
     except Exception as exc:
-        print(f"  ❌ Failed: {exc}", file=sys.stderr)
+        print(f"  [FAILED] Failed: {exc}", file=sys.stderr)
         sys.exit(1)
 
     # ------------------------------------------------------------------
@@ -58,10 +58,10 @@ def main():
         print("  Initializing Surya predictor (downloads models on first run) …")
         manager = SuryaInferenceManager()
         predictor = RecognitionPredictor(manager)
-        print("  ✅ Surya OCR models downloaded and cached.")
+        print("  [SUCCESS] Surya OCR models downloaded and cached.")
         del predictor, manager
     except Exception as exc:
-        print(f"  ❌ Failed: {exc}", file=sys.stderr)
+        print(f"  [FAILED] Failed: {exc}", file=sys.stderr)
         sys.exit(1)
 
     # ------------------------------------------------------------------

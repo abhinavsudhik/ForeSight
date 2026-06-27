@@ -9,9 +9,13 @@ Fallback strategy: If the model is unavailable, use keyword-based scoring.
 """
 
 import os
-# Force offline mode for HuggingFace hub
-os.environ["HF_HUB_OFFLINE"] = "1"
-os.environ["TRANSFORMERS_OFFLINE"] = "1"
+if os.environ.get("FORESIGHT_ONLINE") == "1":
+    os.environ["HF_HUB_OFFLINE"] = "0"
+    os.environ["TRANSFORMERS_OFFLINE"] = "0"
+else:
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
 
 import logging
 from dataclasses import dataclass
