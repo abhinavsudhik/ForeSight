@@ -12,8 +12,28 @@ Run once before first use:
 
 All models are cached to ~/.cache/huggingface/ (HuggingFace default).
 """
-
+import os
 import sys
+
+
+# For macOS, default TORCH_DEVICE to "cpu" to prevent MPS segmentation faults
+if sys.platform == 'darwin':
+    if 'TORCH_DEVICE' not in os.environ:
+        os.environ['TORCH_DEVICE'] = 'cpu'
+    
+    # Disable MPS backend globally in PyTorch for Apple Silicon to prevent segfaults
+    try:
+        import torch
+        torch.backends.mps.is_available = lambda: False
+        # Limit PyTorch CPU operations to a single thread to prevent OpenMP sync crashes on macOS
+        torch.set_num_threads(1)
+    except ImportError:
+        pass
+
+    # Prevent OpenMP library conflicts from causing crashes
+    os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
+    # Disable Tokenizers parallelism to prevent thread conflicts during forks/spawns
+    os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
 
 def main():

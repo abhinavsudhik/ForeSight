@@ -47,6 +47,9 @@ _NAME_KEYS = frozenset({
     "buyer_name",
 })
 
+_BUYER_NAME_KEYS = frozenset({"name", "buyer_name", "account_holder"})
+_SELLER_NAME_KEYS = frozenset({"owner_name", "seller_name"})
+
 # Field keys that represent property identifiers
 _PROPERTY_ID_KEYS = frozenset({
     "property_id",
@@ -180,8 +183,15 @@ def _check_name_consistency(
             if idx_a == idx_b:
                 continue
 
+            # Skip if keys are not in the same name group (e.g. comparing buyer name with seller name)
+            is_buyer_a = key_a in _BUYER_NAME_KEYS
+            is_buyer_b = key_b in _BUYER_NAME_KEYS
+            if is_buyer_a != is_buyer_b:
+                continue
+
             score = fuzz.ratio(val_a.lower(), val_b.lower())
             if score < _NAME_SIMILARITY_THRESHOLD:
+                name_role = "Buyer" if is_buyer_a else "Seller/Owner"
                 flags.append(InconsistencyFlag(
                     check="name_consistency",
                     severity="high",
@@ -193,7 +203,7 @@ def _check_name_consistency(
                     },
                     similarity=int(score),
                     message=(
-                        f"Owner name mismatch across {label_a} and {label_b}: "
+                        f"{name_role} name mismatch across {label_a} and {label_b}: "
                         f"'{val_a}' vs '{val_b}' (similarity {int(score)}%)"
                     ),
                 ))
@@ -349,6 +359,84 @@ def _check_timeline_consistency(
     return flags
 
 
+def _parse_numeric(val_str: str) -> Optional[float]:
+    if not val_str:
+        return None
+    import re
+    # Remove commas, currency symbols, and other non-numeric chars except digits and dots
+    clean = re.sub(r"[^\d\.]", "", val_str)
+    try:
+        return float(clean)
+    except ValueError:
+        return None
+
+
+def _check_income_consistency(
+    documents: list[dict],
+) -> list[InconsistencyFlag]:
+    """
+    Collect and compare income/salary figures across documents.
+    If the difference between two documents exceeds 20%, flag it.
+    """
+    INCOME_KEYS = frozenset({
+        "monthly_credits",
+        "gross_salary",
+        "net_salary",
+        "declared_income",
+        "total_income",
+        "salary",
+    })
+    
+    entries = _collect_values(documents, INCOME_KEYS)
+    if len(entries) < 2:
+        return []
+
+    flags: list[InconsistencyFlag] = []
+    seen: set[tuple[int, int]] = set()
+
+    for i, (idx_a, label_a, key_a, val_a) in enumerate(entries):
+        for j, (idx_b, label_b, key_b, val_b) in enumerate(entries):
+            if i >= j:
+                continue
+            pair = (i, j)
+            if pair in seen:
+                continue
+            seen.add(pair)
+
+            if idx_a == idx_b:
+                continue
+
+            num_a = _parse_numeric(val_a)
+            num_b = _parse_numeric(val_b)
+
+            if num_a is not None and num_b is not None:
+                if num_a == 0 and num_b == 0:
+                    continue
+                
+                # Check for >20% discrepancy
+                max_val = max(num_a, num_b)
+                diff = abs(num_a - num_b)
+                discrepancy = diff / max_val if max_val > 0 else 0.0
+                
+                if discrepancy > 0.20:
+                    flags.append(InconsistencyFlag(
+                        check="income_consistency",
+                        severity="high",
+                        evidence={
+                            label_a: val_a,
+                            label_b: val_b,
+                            "field_a": key_a,
+                            "field_b": key_b,
+                        },
+                        message=(
+                            f"Income mismatch across {label_a} and {label_b}: "
+                            f"'{val_a}' vs '{val_b}' (discrepancy of {discrepancy * 100:.1f}%)"
+                        ),
+                    ))
+
+    return flags
+
+
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -425,6 +513,11 @@ def cross_validate(
     time_flags = _check_timeline_consistency(documents)
     all_flags.extend(time_flags)
     logger.info("Timeline consistency check: %d flag(s)", len(time_flags))
+
+    # 4. Income consistency
+    income_flags = _check_income_consistency(documents)
+    all_flags.extend(income_flags)
+    logger.info("Income consistency check: %d flag(s)", len(income_flags))
 
     logger.info(
         "Cross-validation complete — %d total inconsistency flag(s)", len(all_flags)

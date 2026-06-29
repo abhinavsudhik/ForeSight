@@ -9,6 +9,7 @@ import numpy as np
 import logging
 import base64
 import os
+import re
 from PIL import Image, ImageChops, ImageEnhance
 from scipy import ndimage
 from skimage.filters import gaussian
@@ -17,6 +18,9 @@ from io import BytesIO
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+from backend.modules.fft_halftone import analyze_halftone
+from backend.modules.font_weight import analyze_font_weight
 
 
 def _load_image(image_path: str) -> tuple[np.ndarray, Image.Image]:
@@ -105,133 +109,142 @@ def _create_heatmap_overlay(
     return b64
 
 
-def _check_ela(pil_img: Image.Image, cv_img: np.ndarray) -> dict:
+def _is_bank_related_document(document_type: str) -> bool:
     """
-    Error Level Analysis — detects regions compressed at a different
-    quality level than the rest of the image.
-    
-    How it works:
-    1. Save the image to a buffer at quality=90
-    2. Reload the saved version
-    3. Compute per-pixel absolute difference (original vs resaved)
-    4. Amplify the difference map for visibility
-    5. Flag if any region's mean ELA value exceeds the threshold
-    6. NEW: Regional ELA analysis — check if any quadrant has significantly
-       higher ELA than others (catches localized edits like photo swaps)
+    Determines if a document type is bank-related.
     """
-    ELA_QUALITY = 90
-    ELA_AMPLIFY = 10        # multiply difference for visual clarity
-    FLAG_THRESHOLD = 13.5   # mean ELA value above this → suspicious (adjusted up from 12.0)
-    HIGH_THRESHOLD = 22.0   # above this → high severity (adjusted up from 20.0)
-    REGIONAL_RATIO = 3.5    # if any quadrant's mean > 3.5× lowest → localized edit (adjusted up from 3.0)
-    # NOTE: Photographed physical ID cards have natural ELA variation from
-    # JPEG compression of mixed content (photo, text, QR). Previous thresholds
-    # (10.0 / 17.0 / 2.2) caused false positives on genuine cards.
+    if not document_type:
+        return False
+    doc_type_lower = document_type.lower()
+    bank_types = {
+        "bank_statement",
+        "cheque",
+        "demand_draft",
+        "deposit_receipt",
+        "account_opening_form",
+        "loan_application_form",
+        "nach_ecs_mandate",
+        "bank_account",
+    }
+    return doc_type_lower in bank_types or "bank" in doc_type_lower
+
+
+def _check_halftone_runner(image_path: str, document_type: str = None) -> dict:
+    """
+    Runner wrapper for FFT Halftone Analysis.
+    Loads and runs the halftone analysis, generates a log magnitude spectrum visualization.
+    """
+    if not _is_bank_related_document(document_type):
+        logger.info("FFT Halftone Analysis skipped: document type '%s' is not bank-related", document_type)
+        return None
+
+    halftone_res = analyze_halftone(image_path)
     
-    # Step 1: Save at controlled quality into a buffer
-    buffer = BytesIO()
-    pil_img.save(buffer, format="JPEG", quality=ELA_QUALITY)
-    buffer.seek(0)
-    
-    # Step 2: Reload
-    resaved = Image.open(buffer).convert("RGB")
-    
-    # Step 3: Compute difference
-    diff = ImageChops.difference(pil_img, resaved)
-    
-    # Step 4: Amplify and convert to numpy
-    diff_array = np.array(diff).astype(np.float32) * ELA_AMPLIFY
-    diff_array = np.clip(diff_array, 0, 255)
-    
-    # Convert to grayscale anomaly map (mean across RGB channels)
-    ela_map = diff_array.mean(axis=2)
-    
-    # Step 5: Compute statistics
-    mean_ela = float(ela_map.mean())
-    max_ela = float(ela_map.max())
-    
-    # Identify suspicious regions (top 5% brightest pixels)
-    threshold_95 = float(np.percentile(ela_map, 95))
-    suspicious_ratio = float((ela_map > threshold_95).mean())
-    
-    # Step 6: Regional ELA analysis — divide into quadrants
-    h, w = ela_map.shape
-    mid_h, mid_w = h // 2, w // 2
-    quadrants = [
-        ela_map[:mid_h, :mid_w],      # top-left
-        ela_map[:mid_h, mid_w:],       # top-right
-        ela_map[mid_h:, :mid_w],       # bottom-left
-        ela_map[mid_h:, mid_w:],       # bottom-right
-    ]
-    quadrant_means = [float(q.mean()) for q in quadrants]
-    min_quadrant = max(min(quadrant_means), 0.1)  # avoid division by zero
-    max_quadrant = max(quadrant_means)
-    regional_ratio = max_quadrant / min_quadrant
-    
-    # Build flag
+    # Load image and compute log magnitude spectrum for UI visualization
+    img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+    heatmap_b64 = None
+    if img is not None:
+        h, w = img.shape
+        start_y = int(h * 0.25)
+        end_y = int(h * 0.75)
+        start_x = int(w * 0.25)
+        end_x = int(w * 0.75)
+        patch = img[start_y:end_y, start_x:end_x]
+        if patch.size > 0:
+            f_coef = np.fft.fft2(patch)
+            f_shift = np.fft.fftshift(f_coef)
+            magnitude = np.log(np.abs(f_shift) + 1.0)
+            cy, cx = magnitude.shape[0] // 2, magnitude.shape[1] // 2
+            magnitude[cy - 5 : cy + 5, cx - 5 : cx + 5] = 0.0
+            
+            mag_min, mag_max = magnitude.min(), magnitude.max()
+            if mag_max > mag_min:
+                mag_norm = ((magnitude - mag_min) / (mag_max - mag_min) * 255).astype(np.uint8)
+            else:
+                mag_norm = np.zeros_like(magnitude, dtype=np.uint8)
+                
+            mag_norm_resized = cv2.resize(mag_norm, (300, 300))
+            mag_color = cv2.applyColorMap(mag_norm_resized, cv2.COLORMAP_JET)
+            _, buffer = cv2.imencode(".png", mag_color)
+            heatmap_b64 = base64.b64encode(buffer).decode("utf-8")
+            
     flags = []
-    if mean_ela > HIGH_THRESHOLD:
+    if halftone_res["risk"] != "low":
+        severity = "high" if halftone_res["risk"] == "high" else "medium"
         flags.append({
-            "check": "tampering_ela",
-            "severity": "high",
-            "message": (
-                f"ELA analysis detected strong compression inconsistencies "
-                f"(mean ELA: {mean_ela:.1f}, threshold: {HIGH_THRESHOLD}). "
-                f"Multiple regions appear to have been inserted from another source."
-            ),
-            "evidence": {
-                "mean_ela_value": round(mean_ela, 2),
-                "max_ela_value": round(max_ela, 2),
-                "suspicious_region_ratio": f"{suspicious_ratio:.1%}",
-            },
-        })
-    elif mean_ela > FLAG_THRESHOLD:
-        flags.append({
-            "check": "tampering_ela",
-            "severity": "medium",
-            "message": (
-                f"ELA analysis detected moderate compression inconsistencies "
-                f"(mean ELA: {mean_ela:.1f}). Some regions may have been edited."
-            ),
-            "evidence": {
-                "mean_ela_value": round(mean_ela, 2),
-                "max_ela_value": round(max_ela, 2),
-                "suspicious_region_ratio": f"{suspicious_ratio:.1%}",
-            },
-        })
-    
-    # Regional ELA flag — catches localized edits that global mean misses
-    if regional_ratio > REGIONAL_RATIO and not flags:
-        severity = "high" if regional_ratio > 4.0 else "medium"
-        flags.append({
-            "check": "tampering_ela",
+            "check": "tampering_halftone",
             "severity": severity,
-            "message": (
-                f"Regional ELA analysis detected localized compression inconsistency. "
-                f"One region has {regional_ratio:.1f}× higher ELA than the cleanest region, "
-                f"suggesting a localized edit (e.g., photo replacement or text insertion)."
-            ),
+            "message": halftone_res["interpretation"],
             "evidence": {
-                "mean_ela_value": round(mean_ela, 2),
-                "regional_ratio": round(regional_ratio, 2),
-                "quadrant_means": [round(q, 2) for q in quadrant_means],
-            },
+                "peak_sharpness_ratio": halftone_res["peak_sharpness_ratio"],
+                "strong_peak_count": halftone_res["strong_peak_count"],
+                "likely_professional_print": halftone_res["likely_professional_print"],
+            }
         })
-    
-    heatmap_b64 = _create_heatmap_overlay(
-        cv_img, ela_map, cv2.COLORMAP_JET, min_val=4.0, max_val=20.0
-    )
-    
+        
     return {
-        "check": "ela",
-        "label": "JPEG Error Level Analysis",
+        "check": "halftone",
+        "label": "FFT Halftone Analysis",
         "heatmap_b64": heatmap_b64,
-        "mean_value": round(mean_ela, 2),
+        "mean_value": halftone_res["peak_sharpness_ratio"],
         "flags": flags,
+        "penalty_weight": halftone_res["penalty_weight"],
         "description": (
-            "Highlights regions with compression inconsistencies. "
-            "Red/bright areas indicate pixels that may have been inserted or edited."
-        ),
+            "Analyzes spatial frequency peaks to detect printing techniques. "
+            "Sharp frequency peaks indicate professional offset printing, "
+            "while diffuse frequencies suggest home inkjet or digital editing."
+        )
+    }
+
+
+def _check_font_weight_runner(image_path: str, ocr_word_boxes: list) -> dict:
+    """
+    Runner wrapper for Font Weight Inconsistency analysis.
+    Runs the font weight check, draws red bounding boxes around outliers for visualization.
+    """
+    font_res = analyze_font_weight(image_path, ocr_word_boxes)
+    
+    img = cv2.imread(image_path)
+    heatmap_b64 = None
+    if img is not None:
+        vis_img = img.copy()
+        for word_info in font_res.get("outlier_words", []):
+            box = word_info.get("box")
+            if box:
+                bx, by, bw, bh = box
+                cv2.rectangle(vis_img, (bx, by), (bx + bw, by + bh), (0, 0, 255), 2)
+                cv2.putText(vis_img, word_info["word"], (bx, max(15, by - 5)), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+                            
+        _, buffer = cv2.imencode(".png", vis_img)
+        heatmap_b64 = base64.b64encode(buffer).decode("utf-8")
+        
+    flags = []
+    if font_res["risk"] != "low":
+        severity = "high" if font_res["risk"] == "high" else "medium"
+        flags.append({
+            "check": "tampering_font_weight",
+            "severity": severity,
+            "message": f"Font weight inconsistency detected: {font_res['outlier_count']} outlier word(s) found.",
+            "evidence": {
+                "mean_stroke_width": font_res["mean_stroke_width"],
+                "std_deviation": font_res["std_deviation"],
+                "outlier_count": font_res["outlier_count"],
+                "outlier_words": font_res["outlier_words"][:10],
+            }
+        })
+        
+    return {
+        "check": "font_weight",
+        "label": "Font Weight Inconsistency",
+        "heatmap_b64": heatmap_b64,
+        "mean_value": float(font_res["outlier_count"]),
+        "flags": flags,
+        "penalty_weight": font_res["penalty_weight"],
+        "description": (
+            "Scans document for words with anomalous line thickness/font weight. "
+            "Highlights outlier words in red, suggesting insertions or font swaps."
+        )
     }
 
 
@@ -880,7 +893,6 @@ def _check_face_region_tampering(cv_img: np.ndarray) -> dict:
     # Key distinguishers: edge sharpness and compression quality are the most
     # reliable because they're high for digital paste but low for physical cards.
     NOISE_RATIO_THRESHOLD = 3.4    # adjusted up from 3.2 to catch subtler noise inconsistencies
-    ELA_RATIO_THRESHOLD = 2.4      # adjusted up from 2.2 to be more sensitive to photo ELA variations
     EDGE_STRENGTH_THRESHOLD = 53.0 # adjusted up from 50.0 to detect cut-and-paste seams
     LUMINANCE_DIFF_THRESHOLD = 0.48 # adjusted down from 0.50
     COMPRESSION_RATIO_THRESHOLD = 3.0 # adjusted down from 3.5 to detect quantization discrepancies
@@ -930,23 +942,7 @@ def _check_face_region_tampering(cv_img: np.ndarray) -> dict:
     if noise_ratio > NOISE_RATIO_THRESHOLD:
         anomaly_count += 1
     
-    # --- Metric B: ELA intensity ratio ---
-    pil_img = Image.fromarray(cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB))
-    buffer = BytesIO()
-    pil_img.save(buffer, format="JPEG", quality=90)
-    buffer.seek(0)
-    resaved = Image.open(buffer).convert("RGB")
-    diff = np.array(ImageChops.difference(pil_img, resaved)).astype(np.float32).mean(axis=2)
-    
-    face_ela_mean = float(diff[face_mask].mean()) if face_mask.any() else 0
-    bg_ela_mean = float(diff[bg_mask].mean()) if bg_mask.any() else 1e-6
-    ela_ratio = face_ela_mean / max(bg_ela_mean, 1e-6)
-    
-    sub_metrics["ela_ratio"] = round(ela_ratio, 2)
-    if ela_ratio > ELA_RATIO_THRESHOLD:
-        anomaly_count += 1
-    
-    # --- Metric C: Edge discontinuity at face boundary ---
+    # --- Metric B: Edge discontinuity at face boundary ---
     sobel_x = cv2.Sobel(gray_f, cv2.CV_64F, 1, 0, ksize=3)
     sobel_y = cv2.Sobel(gray_f, cv2.CV_64F, 0, 1, ksize=3)
     gradient_mag = np.sqrt(sobel_x**2 + sobel_y**2)
@@ -965,7 +961,7 @@ def _check_face_region_tampering(cv_img: np.ndarray) -> dict:
     if boundary_gradient > EDGE_STRENGTH_THRESHOLD:
         anomaly_count += 1
     
-    # --- Metric D: Color statistics mismatch ---
+    # --- Metric C: Color statistics mismatch ---
     face_lum_std = float(gray_f[face_mask].std()) if face_mask.any() else 0
     bg_lum_std = float(gray_f[bg_mask].std()) if bg_mask.any() else 1e-6
     max_std = max(face_lum_std, bg_lum_std, 1e-6)
@@ -975,7 +971,7 @@ def _check_face_region_tampering(cv_img: np.ndarray) -> dict:
     if lum_diff > LUMINANCE_DIFF_THRESHOLD:
         anomaly_count += 1
     
-    # --- Metric E: JPEG compression quality difference ---
+    # --- Metric D: JPEG compression quality difference ---
     face_blocks_var = []
     bg_blocks_var = []
     for by in range(0, h - 8, 8):
@@ -1001,7 +997,7 @@ def _check_face_region_tampering(cv_img: np.ndarray) -> dict:
         anomaly_count += 1
     
     # --- Paint the face map for heatmap ---
-    face_map[face_mask] = float(anomaly_count) / 5.0 * 255
+    face_map[face_mask] = float(anomaly_count) / 4.0 * 255
     face_map[boundary_mask] = min(boundary_gradient / EDGE_STRENGTH_THRESHOLD, 1.0) * 255
     
     # --- Build flags ---
@@ -1011,8 +1007,6 @@ def _check_face_region_tampering(cv_img: np.ndarray) -> dict:
         triggered = []
         if noise_ratio > NOISE_RATIO_THRESHOLD:
             triggered.append(f"noise ({noise_ratio:.1f}×)")
-        if ela_ratio > ELA_RATIO_THRESHOLD:
-            triggered.append(f"ELA ({ela_ratio:.1f}×)")
         if boundary_gradient > EDGE_STRENGTH_THRESHOLD:
             triggered.append(f"edge ({boundary_gradient:.0f})")
         if compression_ratio > COMPRESSION_RATIO_THRESHOLD:
@@ -1024,13 +1018,13 @@ def _check_face_region_tampering(cv_img: np.ndarray) -> dict:
             "check": "tampering_face_region",
             "severity": severity,
             "message": (
-                f"Face region analysis detected {anomaly_count}/5 tampering indicators "
+                f"Face region analysis detected {anomaly_count}/4 tampering indicators "
                 f"({', '.join(triggered)}). The photo area shows characteristics "
                 f"inconsistent with the rest of the document, suggesting the "
                 f"photo may have been replaced or digitally inserted."
             ),
             "evidence": {
-                "anomaly_count": f"{anomaly_count}/5",
+                "anomaly_count": f"{anomaly_count}/4",
                 "face_bbox": f"({fx},{fy},{fw},{fh})",
                 **sub_metrics,
             },
@@ -1055,26 +1049,363 @@ def _check_face_region_tampering(cv_img: np.ndarray) -> dict:
     }
 
 
-def detect_tampering(image_path: str) -> dict:
+def is_high_value_field(text: str) -> bool:
     """
-    Run all five tampering checks on a document image.
+    Check if a text block corresponds to a high-value field (amount, account, date, PAN, Aadhaar).
+    """
+    cleaned = text.strip()
+    if not cleaned:
+        return False
+    
+    cleaned_upper = cleaned.upper()
+    
+    # 1. PAN Pattern (e.g. ABCDE1234F)
+    if re.match(r'^[A-Z]{5}\d{4}[A-Z]$', cleaned_upper):
+        return True
+        
+    # 2. Aadhaar Pattern (12 digits, can be spaced or hyphenated)
+    if re.match(r'^\d{4}[-\s]?\d{4}[-\s]?\d{4}$', cleaned):
+        return True
+        
+    # 3. Date Patterns (e.g., DD/MM/YYYY, DD-MM-YYYY, YYYY-MM-DD)
+    if re.match(r'^\d{1,4}[-/\.]\d{1,2}[-/\.]\d{1,4}$', cleaned):
+        return True
+        
+    # 4. Account Numbers (9 to 18 digits)
+    if re.match(r'^\d{9,18}$', cleaned):
+        return True
+        
+    # 5. Amounts (e.g. ₹50,000, 12345.67, $100.00)
+    # Remove common currency symbols and commas
+    amt_cleaned = re.sub(r'[₹\$\€\£\,]', '', cleaned)
+    if re.match(r'^\d+(\.\d+)?$', amt_cleaned):
+        try:
+            # Check if it has 3+ digits or contains a decimal point
+            if len(re.sub(r'\D', '', cleaned)) >= 3 or '.' in amt_cleaned:
+                return True
+        except Exception:
+            pass
+            
+    return False
+
+
+def check_background_pattern_disruption(image: np.ndarray, ocr_bboxes: list) -> dict:
+    """
+    Background Pattern Disruption analysis check.
+    Detects editing in high-value numeric fields by analyzing local background texture variance 
+    and Gabor energy against the global document background.
+    """
+    if ocr_bboxes is None or len(ocr_bboxes) == 0:
+        return {
+            "check": "background_pattern_disruption",
+            "label": "Background Pattern Disruption",
+            "status": "skipped",
+            "penalty_applied": 0.0,
+            "penalty_weight": 0.0,
+            "flagged_fields": [],
+            "global_variance": 0.0,
+            "skipped": True,
+            "skip_reason": "no_ocr_data",
+            "heatmap_b64": None,
+            "mean_value": 0.0,
+            "flags": [],
+            "description": "Background pattern disruption check was skipped: No OCR data available."
+        }
+        
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    h_img, w_img = gray.shape[:2]
+    
+    # 1. Separate high-value boxes and construct a global OCR exclusion mask
+    high_value_boxes = []
+    ocr_mask = np.zeros(gray.shape, dtype=np.uint8)
+    
+    for item in ocr_bboxes:
+        if isinstance(item, dict):
+            text = item.get("text", "")
+            box = item.get("box", [0, 0, 0, 0])
+            if len(box) == 4:
+                x, y, w, h = box
+            else:
+                continue
+        elif isinstance(item, (tuple, list)) and len(item) == 5:
+            x, y, w, h, text = item
+        else:
+            continue
+            
+        x, y, w, h = int(x), int(y), int(w), int(h)
+        # Exclude all OCR words from global background sampling
+        ocr_mask[max(0, y):min(h_img, y+h), max(0, x):min(w_img, x+w)] = 255
+        
+        # Categorize text field
+        if is_high_value_field(text):
+            # Try to identify field name from format
+            cleaned = text.strip()
+            cleaned_upper = cleaned.upper()
+            if re.match(r'^[A-Z]{5}\d{4}[A-Z]$', cleaned_upper):
+                field_name = "pan"
+            elif re.match(r'^\d{4}[-\s]?\d{4}[-\s]?\d{4}$', cleaned):
+                field_name = "aadhaar"
+            elif re.match(r'^\d{1,4}[-/\.]\d{1,2}[-/\.]\d{1,4}$', cleaned):
+                field_name = "date"
+            elif re.match(r'^\d{9,18}$', cleaned):
+                field_name = "account_number"
+            else:
+                field_name = "amount"
+                
+            high_value_boxes.append({
+                "field_name": field_name,
+                "bbox": [x, y, w, h],
+                "text": text
+            })
+            
+    if not high_value_boxes:
+        return {
+            "check": "background_pattern_disruption",
+            "label": "Background Pattern Disruption",
+            "status": "skipped",
+            "penalty_applied": 0.0,
+            "penalty_weight": 0.0,
+            "flagged_fields": [],
+            "global_variance": 0.0,
+            "skipped": True,
+            "skip_reason": "no_high_value_fields",
+            "heatmap_b64": None,
+            "mean_value": 0.0,
+            "flags": [],
+            "description": "Background pattern disruption check was skipped: No high-value numeric fields found to analyze."
+        }
+        
+    # 2. Global background segmentation
+    # Run adaptive thresholding globally to separate text stroke foreground from background
+    global_thresh = cv2.adaptiveThreshold(
+        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 30
+    )
+    # Background pixels are: threshold == 0 AND outside any OCR box
+    # We dilate the text mask to remove text edge transitions from background variance
+    global_text_mask = (global_thresh == 255) | (ocr_mask == 255)
+    dilation_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    dilated_global_text = cv2.dilate(global_text_mask.astype(np.uint8), dilation_kernel)
+    global_bg_mask = (dilated_global_text == 0)
+    
+    # Fallback if too few pixels in global_bg_mask
+    if np.sum(global_bg_mask) < 1000:
+        global_bg_mask = (global_thresh == 0)
+        
+    # 3. Global background texture variance
+    global_laplacian = cv2.Laplacian(gray, cv2.CV_64F)
+    global_bg_vals = global_laplacian[global_bg_mask]
+    
+    if len(global_bg_vals) > 0:
+        global_variance = float(np.var(global_bg_vals))
+    else:
+        global_variance = 0.0
+        
+    # If the document has no background pattern at all (below noise floor threshold of 5.0)
+    if global_variance < 5.0:
+        return {
+            "check": "background_pattern_disruption",
+            "label": "Background Pattern Disruption",
+            "status": "skipped",
+            "penalty_applied": 0.0,
+            "penalty_weight": 0.0,
+            "flagged_fields": [],
+            "global_variance": round(global_variance, 3),
+            "skipped": True,
+            "skip_reason": "no_background_pattern",
+            "heatmap_b64": None,
+            "mean_value": 0.0,
+            "flags": [],
+            "description": "Background pattern disruption check was skipped: Document has no background security pattern (variance is below noise floor)."
+        }
+        
+    # 4. Gabor filter bank on global image
+    # Orientations: 0, 45, 90, 135 degrees; frequency 0.3 -> lambda = 1.0 / 0.3
+    gabor_kernels = []
+    orientations = [0, np.pi/4, np.pi/2, 3*np.pi/4]
+    for theta in orientations:
+        kernel = cv2.getGaborKernel(
+            ksize=(15, 15),
+            sigma=2.0,
+            theta=theta,
+            lambd=1.0/0.3,
+            gamma=0.5,
+            psi=0,
+            ktype=cv2.CV_64F
+        )
+        gabor_kernels.append(kernel)
+        
+    gray_f = gray.astype(np.float64)
+    gabor_energy_images = []
+    global_gabor_energies = []
+    
+    for kernel in gabor_kernels:
+        response = cv2.filter2D(gray_f, cv2.CV_64F, kernel)
+        energy_img = response ** 2
+        gabor_energy_images.append(energy_img)
+        
+        # Calculate global Gabor energy on the global background mask
+        global_vals = energy_img[global_bg_mask]
+        global_energy = float(np.mean(global_vals)) if len(global_vals) > 0 else 0.0
+        global_gabor_energies.append(global_energy)
+        
+    # Determine dominant orientations where global background Gabor energy has signal (> 5.0)
+    dominant_orientations = [i for i, energy in enumerate(global_gabor_energies) if energy > 5.0]
+    
+    # 5. Local Field Analysis
+    flagged_fields = []
+    clean_fields = []
+    expansion = 10
+    
+    for field in high_value_boxes:
+        field_name = field["field_name"]
+        x, y, w, h = field["bbox"]
+        
+        # Expand region by 8-12 (we use 10) pixels on all sides
+        ex0 = max(0, x - expansion)
+        ey0 = max(0, y - expansion)
+        ex1 = min(w_img, x + w + expansion)
+        ey1 = min(h_img, y + h + expansion)
+        
+        if (ex1 - ex0) < 11 or (ey1 - ey0) < 11:
+            continue
+            
+        patch_gray = gray[ey0:ey1, ex0:ex1]
+        
+        # Local adaptive thresholding to isolate local background
+        local_thresh = cv2.adaptiveThreshold(
+            patch_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 30
+        )
+        # Dilate local text mask
+        dilated_local_text = cv2.dilate(local_thresh.astype(np.uint8), dilation_kernel)
+        local_bg_mask = (dilated_local_text == 0)
+        
+        # A. Laplacian Variance check
+        local_laplacian = global_laplacian[ey0:ey1, ex0:ex1]
+        local_bg_vals = local_laplacian[local_bg_mask]
+        
+        if len(local_bg_vals) > 0:
+            local_variance = float(np.var(local_bg_vals))
+        else:
+            local_variance = 0.0
+            
+        ratio = local_variance / global_variance if global_variance > 0 else 1.0
+        
+        triggered_check = None
+        trigger_ratio = ratio
+        
+        if ratio < 0.15 or ratio > 4.0:
+            triggered_check = "laplacian"
+            trigger_ratio = ratio
+            
+        # B. Gabor energy checks on dominant orientations
+        g_ratios = []
+        if not triggered_check and dominant_orientations:
+            for idx in dominant_orientations:
+                local_energy_vals = gabor_energy_images[idx][ey0:ey1, ex0:ex1][local_bg_mask]
+                local_energy = float(np.mean(local_energy_vals)) if len(local_energy_vals) > 0 else 0.0
+                global_energy = global_gabor_energies[idx]
+                
+                g_ratio = local_energy / global_energy if global_energy > 0 else 1.0
+                g_ratios.append(round(g_ratio, 3))
+                if g_ratio < 0.30:  # Guilloche pattern disrupted/erased locally
+                    triggered_check = "gabor"
+                    trigger_ratio = g_ratio
+                    break
+        field_result = {
+            "field_name": field_name,
+            "bbox": [x, y, w, h],
+            "local_variance": round(local_variance, 3),
+            "global_variance": round(global_variance, 3),
+            "ratio": round(trigger_ratio, 3),
+        }
+        
+        if triggered_check:
+            field_result["trigger"] = triggered_check
+            flagged_fields.append(field_result)
+        else:
+            clean_fields.append(field_result)
+            
+    # 6. Visualize results: Draw rectangles on image
+    vis_img = image.copy()
+    for field in flagged_fields:
+        x, y, w, h = field["bbox"]
+        # Red box for flagged
+        cv2.rectangle(vis_img, (x, y), (x + w, y + h), (0, 0, 255), 2)
+        label = f"{field['field_name']}: {field['ratio']:.2f} ({field['trigger']})"
+        cv2.putText(vis_img, label, (x, max(15, y - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
+        
+    for field in clean_fields:
+        x, y, w, h = field["bbox"]
+        # Green box for clean
+        cv2.rectangle(vis_img, (x, y), (x + w, y + h), (0, 255, 0), 1)
+        label = f"{field['field_name']}: {field['ratio']:.2f}"
+        cv2.putText(vis_img, label, (x, max(15, y - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 0), 1)
+        
+    # Encode visualization image
+    _, buffer = cv2.imencode(".png", vis_img)
+    heatmap_b64 = base64.b64encode(buffer).decode("utf-8")
+    
+    is_flagged = len(flagged_fields) > 0
+    status = "flagged" if is_flagged else "clean"
+    penalty_weight = 0.65 if is_flagged else 0.0
+    
+    flags = []
+    if is_flagged:
+        flagged_details = ", ".join([f"{f['field_name']} (ratio: {f['ratio']:.3f})" for f in flagged_fields])
+        flags.append({
+            "check": "background_pattern_disruption",
+            "severity": "high",
+            "message": f"Background pattern disruption detected on: {flagged_details}.",
+            "evidence": {
+                "flagged_fields": flagged_fields
+            }
+        })
+        
+    return {
+        "check": "background_pattern_disruption",
+        "label": "Background Pattern Disruption",
+        "status": status,
+        "penalty_applied": penalty_weight,
+        "penalty_weight": penalty_weight,
+        "flagged_fields": flagged_fields,
+        "global_variance": round(global_variance, 3),
+        "skipped": False,
+        "skip_reason": None,
+        "heatmap_b64": heatmap_b64,
+        "mean_value": len(flagged_fields),
+        "flags": flags,
+        "description": (
+            "Detects edits behind high-value numeric fields by analyzing local background "
+            "texture variance and Gabor energy against the global document background. "
+            "Erased or disrupted textures are flagged as tampered."
+        )
+    }
+
+
+def detect_tampering(image_path: str, ocr_word_boxes: list = None, document_type: str = None) -> dict:
+    """
+    Run all visual tampering checks on a document image.
     
     Parameters
     ----------
     image_path : str
         Path to a JPEG, PNG, or TIFF image file.
-        For PDFs, pass the path of a rendered page image
-        (the OCR engine already produces these as temp files).
+    ocr_word_boxes : list, optional
+        List of (x, y, w, h, text) tuples from OCR. Passed to font weight check.
+    document_type : str, optional
+        The classification type of the document (e.g., 'bank_statement'). Used
+        to conditionally enable/disable document-specific checks.
     
     Returns
     -------
     dict
         {
-            "checks":       list[dict]  — one result dict per check,
-            "flags":        list[dict]  — all flags across all checks,
-            "heatmaps":     dict        — { check_name: base64_png },
-            "summary":      str         — human readable summary,
-            "risk_level":   str         — "clean" / "suspicious" / "high_risk"
+            "checks":          list[dict]  — one result dict per check,
+            "flags":           list[dict]  — all flags across all checks,
+            "heatmaps":        dict        — { check_name: base64_png },
+            "summary":         str         — human readable summary,
+            "risk_level":      str         — "clean" / "suspicious" / "high_risk",
+            "penalty_weight":  float       — highest penalty weight found across all sub-checks
         }
     """
     logger.info("Starting tampering analysis on: %s", image_path)
@@ -1089,15 +1420,18 @@ def detect_tampering(image_path: str) -> dict:
             "heatmaps": {},
             "summary": f"Image could not be loaded: {exc}",
             "risk_level": "unknown",
+            "penalty_weight": 0.0,
         }
     
-    # Run all five checks
+    # Run all sub-checks
     results = []
     all_flags = []
     heatmaps = {}
     
     checks_to_run = [
-        ("ELA",        lambda: _check_ela(pil_img, cv_img)),
+        ("Halftone",   lambda: _check_halftone_runner(image_path, document_type)),
+        ("FontWeight", lambda: _check_font_weight_runner(image_path, ocr_word_boxes)),
+        ("BackgroundPatternDisruption", lambda: check_background_pattern_disruption(cv_img, ocr_word_boxes)),
         ("Blur",       lambda: _check_blur_inconsistency(cv_img)),
         ("Noise",      lambda: _check_noise_inconsistency(cv_img)),
         ("Artifacts",  lambda: _check_pixel_artifacts(cv_img)),
@@ -1119,7 +1453,7 @@ def detect_tampering(image_path: str) -> dict:
         except Exception as exc:
             logger.error("%s check failed: %s", check_name, exc)
     
-    # Determine overall risk level
+    # Determine overall risk level based on flags
     high_flags = sum(1 for f in all_flags if f.get("severity") == "high")
     medium_flags = sum(1 for f in all_flags if f.get("severity") == "medium")
     
@@ -1142,7 +1476,25 @@ def detect_tampering(image_path: str) -> dict:
     else:
         summary = "No tampering indicators detected. Document appears unmodified."
     
-    logger.info("Tampering analysis complete — risk level: %s", risk_level)
+    # Determine the overall highest penalty weight across all checks
+    # For checks without explicit penalty_weight, map severity of their flags
+    all_penalty_weights = [0.0]
+    for r in results:
+        if "penalty_weight" in r:
+            all_penalty_weights.append(r["penalty_weight"])
+        elif r.get("flags"):
+            severities = [f.get("severity", "low").lower() for f in r["flags"]]
+            if "high" in severities:
+                all_penalty_weights.append(0.60)
+            elif "medium" in severities:
+                all_penalty_weights.append(0.35)
+            else:
+                all_penalty_weights.append(0.10)
+                
+    highest_penalty_weight = max(all_penalty_weights)
+    
+    logger.info("Tampering analysis complete — risk level: %s, penalty weight: %.2f", 
+                risk_level, highest_penalty_weight)
     
     return {
         "checks": results,
@@ -1150,18 +1502,20 @@ def detect_tampering(image_path: str) -> dict:
         "heatmaps": heatmaps,
         "summary": summary,
         "risk_level": risk_level,
+        "penalty_weight": highest_penalty_weight,
     }
 
 
-
-def detect_tampering_from_pdf_page(pdf_path: str, page_number: int = 0) -> dict:
+def detect_tampering_from_pdf_page(pdf_path: str, page_number: int = 0, ocr_word_boxes: list = None, document_type: str = None) -> dict:
     """
     Render a single PDF page to an image and run tampering analysis.
     
     Parameters
     ----------
-    pdf_path    : str — path to the PDF file
-    page_number : int — zero-indexed page number (default: first page)
+    pdf_path        : str — path to the PDF file
+    page_number     : int — zero-indexed page number (default: first page)
+    ocr_word_boxes  : list, optional — list of word bounding boxes
+    document_type   : str, optional — the document classification label
     """
     import fitz
     import tempfile
@@ -1182,7 +1536,7 @@ def detect_tampering_from_pdf_page(pdf_path: str, page_number: int = 0) -> dict:
         pix.save(tmp_path)
         
         # Run tampering analysis on the rendered image
-        result = detect_tampering(tmp_path)
+        result = detect_tampering(tmp_path, ocr_word_boxes, document_type)
         
         # Clean up
         os.unlink(tmp_path)
@@ -1192,9 +1546,12 @@ def detect_tampering_from_pdf_page(pdf_path: str, page_number: int = 0) -> dict:
     except Exception as exc:
         logger.error("PDF page render failed: %s", exc)
         return {
-            "checks": [], "flags": [], "heatmaps": {},
+            "checks": [],
+            "flags": [],
+            "heatmaps": {},
             "summary": f"Could not analyse PDF page: {exc}",
             "risk_level": "unknown",
+            "penalty_weight": 0.0,
         }
 
 

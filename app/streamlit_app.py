@@ -15,6 +15,35 @@ Six tabs:
 import os
 import sys
 
+# Ensure Homebrew's lib path is added to DYLD_LIBRARY_PATH on macOS for pyzbar to locate libzbar.dylib
+if sys.platform == 'darwin':
+    # Force PyTorch and Surya OCR to use CPU to prevent segmentation faults (exit code 139)
+    # caused by PyTorch initializing MPS inside spawned child processes on macOS.
+    if 'TORCH_DEVICE' not in os.environ:
+        os.environ['TORCH_DEVICE'] = 'cpu'
+    
+    # Disable MPS backend globally in PyTorch for Apple Silicon to prevent segfaults
+    try:
+        import torch
+        torch.backends.mps.is_available = lambda: False
+        # Limit PyTorch CPU operations to a single thread to prevent OpenMP sync crashes on macOS
+        torch.set_num_threads(1)
+    except ImportError:
+        pass
+
+    # Prevent OpenMP library conflicts from causing crashes
+    os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
+    # Disable Tokenizers parallelism to prevent thread conflicts during forks/spawns
+    os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+
+    _brew_lib = '/opt/homebrew/lib'
+    if os.path.exists(_brew_lib):
+        _current_dyld = os.environ.get('DYLD_LIBRARY_PATH', '')
+        _dyld_paths = _current_dyld.split(':') if _current_dyld else []
+        if _brew_lib not in _dyld_paths:
+            _dyld_paths.insert(0, _brew_lib)
+            os.environ['DYLD_LIBRARY_PATH'] = ':'.join(_dyld_paths)
+
 # ---------------------------------------------------------------------------
 # Force HuggingFace libraries and tokenizers to run in offline mode.
 # This prevents network calls to huggingface.co for already downloaded models.
@@ -56,6 +85,10 @@ from backend.modules.metadata_analyzer import analyze_metadata
 from backend.modules.financial_anomaly import detect_financial_anomalies
 from backend.modules.risk_scorer import calculate_trust_score
 from backend.modules.recommendation_engine import generate_recommendation
+
+from backend.modules.validators import run_all as run_format_validators
+from backend.modules.api_verifier import route_api
+from backend.modules import scoring_engine
 
 logger = logging.getLogger(__name__)
 
@@ -420,7 +453,7 @@ def _get_applicant_name(documents: list[dict]) -> str:
 # Processing pipeline
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _run_pipeline(uploaded_files) -> dict:
+def _run_pipeline(uploaded_files, mode: str = "offline") -> dict:
     """
     Execute the full ForeSight analysis pipeline on uploaded files.
 
@@ -431,7 +464,7 @@ def _run_pipeline(uploaded_files) -> dict:
     all_metadata_results: list[dict] = []
     financial_result: dict | None = None
 
-    total_steps = len(uploaded_files) * 3 + 5  # OCR+Classify+Extract per file, + cross/meta/tamper/fin/score
+    total_steps = len(uploaded_files) * 5 + 5  # OCR+Classify+Extract+Format+API per file, + cross/meta/tamper/fin/score
     current_step = 0
     progress = st.progress(0, text="Starting analysis...")
 
@@ -518,6 +551,7 @@ def _run_pipeline(uploaded_files) -> dict:
                 "ocr_status": ocr_result.status,
                 "ocr_diagnostics": ocr_result.diagnostics,
                 "ocr_method": ocr_result.method,
+                "word_boxes": ocr_result.word_boxes,
             }
         else:
             try:
@@ -534,6 +568,7 @@ def _run_pipeline(uploaded_files) -> dict:
                     "ocr_status": ocr_result.status,
                     "ocr_diagnostics": ocr_result.diagnostics,
                     "ocr_method": ocr_result.method,
+                    "word_boxes": ocr_result.word_boxes,
                 }
             except ValueError as exc:
                 st.warning(f"**{filename}**: Field extraction failed — {exc}")
@@ -549,7 +584,29 @@ def _run_pipeline(uploaded_files) -> dict:
                     "ocr_status": ocr_result.status,
                     "ocr_diagnostics": ocr_result.diagnostics,
                     "ocr_method": ocr_result.method,
+                    "word_boxes": ocr_result.word_boxes,
                 }
+
+        # Step 4: Format & Checksum Validation
+        current_step += 1
+        progress.progress(
+            current_step / total_steps,
+            text=f"Running format validation on {filename}...",
+        )
+        format_res = run_format_validators(doc_record.get("fields", {}))
+        doc_record["format_checksum"] = format_res
+
+        # Step 5: API Verification
+        current_step += 1
+        progress.progress(
+            current_step / total_steps,
+            text=f"Running API verification on {filename}...",
+        )
+        api_fields = dict(doc_record.get("fields", {}))
+        api_fields["image_path"] = tmp_path
+        api_res = route_api(doc_record["document_type"], api_fields, mode=mode)
+        doc_record["api_verification"] = api_res
+
         documents.append(doc_record)
 
     # ------------------------------------------------------------------
@@ -563,29 +620,8 @@ def _run_pipeline(uploaded_files) -> dict:
     cross_doc_flags = cross_validate(documents)
 
     # ------------------------------------------------------------------
-    # Phase 3 — Metadata analysis (per PDF)
-    # ------------------------------------------------------------------
-    current_step += 1
-    progress.progress(
-        current_step / total_steps,
-        text="Analysing PDF metadata...",
-    )
+    # Phase 3 — Metadata analysis (deprecated and removed)
     all_metadata_flags: list[dict] = []
-    for doc in documents:
-        if doc["tmp_path"].lower().endswith(".pdf"):
-            # Pass the fields dictionary to let the analyzer fetch the issue date
-            meta_result = analyze_metadata(
-                doc["tmp_path"],
-                doc["fields"],
-                ocr_method=doc.get("ocr_method", "unknown"),
-            )
-            all_metadata_results.append({
-                "filename": doc["filename"],
-                "metadata": meta_result["metadata"],
-                "flags": meta_result["flags"],
-                "summary": meta_result["summary"],
-            })
-            all_metadata_flags.extend(meta_result["flags"])
 
     
     # Phase 3b — Visual tampering analysis (per document)
@@ -598,11 +634,23 @@ def _run_pipeline(uploaded_files) -> dict:
     for doc in documents:
         path = doc["tmp_path"]
         ext = os.path.splitext(path)[1].lower()
+        ocr_word_tuples = []
+        for w in doc.get("word_boxes", []):
+            b = w["box"]
+            ocr_word_tuples.append((b[0], b[1], b[2], b[3], w["text"]))
         try:
             if ext == ".pdf":
-                tamper_result = detect_tampering_from_pdf_page(path)
+                tamper_result = detect_tampering_from_pdf_page(
+                    path,
+                    ocr_word_boxes=ocr_word_tuples,
+                    document_type=doc.get("document_type")
+                )
             else:
-                tamper_result = detect_tampering(path)
+                tamper_result = detect_tampering(
+                    path,
+                    ocr_word_boxes=ocr_word_tuples,
+                    document_type=doc.get("document_type")
+                )
             all_tampering_results.append({
                 "filename": doc["filename"],
                 "result": tamper_result,
@@ -633,24 +681,204 @@ def _run_pipeline(uploaded_files) -> dict:
     # Phase 5 — Trust score & recommendation
     # ------------------------------------------------------------------
     current_step += 1
-
-    tampering_flags = []
-    for tr in all_tampering_results:
-        tampering_flags.extend(tr["result"].get("flags", []))
-
     progress.progress(
         current_step / total_steps,
         text="Calculating trust score...",
     )
-    
-    score_result = calculate_trust_score(
-        cross_doc_flags=cross_doc_flags,
-        metadata_flags=all_metadata_flags,
-        financial_flags=financial_flags,
-        tampering_flags=tampering_flags,
-    )
-    recommendation = generate_recommendation(score_result)
 
+    # 1. Format/Checksum
+    format_flags = []
+    worst_format_risk = "clean"
+    highest_format_pw = 0.0
+    for doc in documents:
+        f_res = doc.get("format_checksum")
+        if f_res:
+            format_flags.extend(f_res.get("flags", []))
+            if f_res.get("penalty_weight", 0.0) > highest_format_pw:
+                highest_format_pw = f_res["penalty_weight"]
+            if f_res.get("risk") == "high":
+                worst_format_risk = "high"
+            elif f_res.get("risk") == "medium" and worst_format_risk != "high":
+                worst_format_risk = "medium"
+    
+    format_checksum_sec = {
+        "section": "format_checksum",
+        "risk": worst_format_risk,
+        "flags": format_flags,
+        "penalty_weight": highest_format_pw
+    }
+
+    # 2. API Verification
+    api_flags = []
+    worst_api_risk = "clean"
+    highest_api_pw = 0.0
+    for doc in documents:
+        a_res = doc.get("api_verification")
+        if a_res:
+            for f in a_res.get("flags", []):
+                severity = "high"
+                if f == "api_name_mismatch":
+                    severity = "high"
+                elif f in ["missing_id_number", "api_unreachable", "api_not_available"]:
+                    severity = "low"
+                api_flags.append({
+                    "check": f,
+                    "severity": severity,
+                    "message": f"API verification flag: {f}",
+                    "evidence": a_res.get("api_result")
+                })
+            if a_res.get("penalty_weight", 0.0) > highest_api_pw:
+                highest_api_pw = a_res["penalty_weight"]
+            if a_res.get("risk") == "high":
+                worst_api_risk = "high"
+            elif a_res.get("risk") == "medium" and worst_api_risk != "high":
+                worst_api_risk = "medium"
+
+    api_verification_sec = {
+        "section": "api_verification",
+        "risk": worst_api_risk,
+        "flags": api_flags,
+        "penalty_weight": highest_api_pw
+    }
+
+    # 3. Cross-Doc Consistency
+    cross_doc_flags_mapped = []
+    worst_cross_risk = "clean"
+    highest_cross_pw = 0.0
+    
+    from dataclasses import asdict
+    for f in cross_doc_flags:
+        if hasattr(f, "__dataclass_fields__"):
+            f_dict = asdict(f)
+        else:
+            f_dict = f
+        severity = f_dict.get("severity", "low")
+        check = f_dict.get("check", "unknown")
+        pw = 0.0
+        if check == "name_consistency":
+            pw = 0.45
+        elif check == "property_id_consistency":
+            pw = 0.40
+        elif check == "timeline_consistency":
+            pw = 0.30 if severity == "high" else 0.25
+        
+        if pw > highest_cross_pw:
+            highest_cross_pw = pw
+        if severity == "high":
+            worst_cross_risk = "high"
+        elif severity == "medium" and worst_cross_risk != "high":
+            worst_cross_risk = "medium"
+            
+        cross_doc_flags_mapped.append({
+            "check": check,
+            "severity": severity,
+            "message": f_dict.get("message", ""),
+            "penalty_weight": pw,
+            "evidence": f_dict.get("evidence", {})
+        })
+        
+    cross_doc_sec = {
+        "section": "cross_doc_consistency",
+        "risk": worst_cross_risk,
+        "flags": cross_doc_flags_mapped,
+        "penalty_weight": highest_cross_pw
+    }
+
+    # 4. Image Tampering
+    tampering_flags = []
+    worst_tamp_risk = "clean"
+    highest_tamp_pw = 0.0
+    for tr in all_tampering_results:
+        res = tr["result"]
+        for f in res.get("flags", []):
+            tampering_flags.append(f)
+        if res.get("penalty_weight", 0.0) > highest_tamp_pw:
+            highest_tamp_pw = res["penalty_weight"]
+        if res.get("risk_level") == "high_risk":
+            worst_tamp_risk = "high"
+        elif res.get("risk_level") in ["suspicious", "low_suspicion"] and worst_tamp_risk != "high":
+            worst_tamp_risk = "medium"
+            
+    image_tampering_sec = {
+        "section": "image_tampering",
+        "risk": worst_tamp_risk,
+        "flags": tampering_flags,
+        "penalty_weight": highest_tamp_pw
+    }
+
+    # 5. Financial Anomaly
+    financial_flags = []
+    worst_fin_risk = "clean"
+    highest_fin_pw = 0.0
+    if financial_result:
+        financial_flags = financial_result.get("flags", [])
+        for f in financial_flags:
+            severity = f.get("severity", "low").lower()
+            pw = 0.20 if severity == "high" else (0.12 if severity == "medium" else 0.03)
+            if pw > highest_fin_pw:
+                highest_fin_pw = pw
+            if severity == "high":
+                worst_fin_risk = "high"
+            elif severity == "medium" and worst_fin_risk != "high":
+                worst_fin_risk = "medium"
+                
+    financial_sec = {
+        "section": "financial_anomaly",
+        "risk": worst_fin_risk,
+        "flags": financial_flags,
+        "penalty_weight": highest_fin_pw
+    }
+
+    section_results = [
+        format_checksum_sec,
+        api_verification_sec,
+        cross_doc_sec,
+        image_tampering_sec,
+        financial_sec
+    ]
+
+    score_res = scoring_engine.compute_final_score(section_results)
+    
+    # Map back to UI risk scorer structure
+    trust_score = int(score_res["final_score"] * 100)
+    
+    if trust_score >= 85:
+        risk_level = "Low Risk"
+        color = "green"
+    elif trust_score >= 65:
+        risk_level = "Medium Risk"
+        color = "orange"
+    elif trust_score >= 40:
+        risk_level = "High Risk"
+        color = "red"
+    else:
+        risk_level = "Critical Risk"
+        color = "darkred"
+        
+    all_flags_flat = []
+    for contrib in score_res.get("section_contributions", []):
+        for f in contrib.get("flags", []):
+            f_mapped = dict(f)
+            f_mapped["penalty"] = int(f.get("penalty_weight", 0.0) * 100)
+            all_flags_flat.append(f_mapped)
+
+    score_result = {
+        "trust_score": trust_score,
+        "risk_level": risk_level,
+        "color": color,
+        "total_flags": len(all_flags_flat),
+        "high_count": sum(1 for f in all_flags_flat if f.get("severity") == "high"),
+        "medium_count": sum(1 for f in all_flags_flat if f.get("severity") == "medium"),
+        "low_count": sum(1 for f in all_flags_flat if f.get("severity") == "low"),
+        "all_flags": all_flags_flat,
+        "hard_kill_triggered": score_res["final_score"] <= 0.20 and any(f.get("check") in ["name_consistency", "property_id_consistency"] for f in all_flags_flat if f.get("severity") == "high"),
+        "base_deductions": 100 - trust_score,
+        "hard_kill_reduction": 0,
+        "tampering_reduction": 0,
+    }
+    
+    recommendation = generate_recommendation(score_result)
+    
     progress.progress(1.0, text="Analysis complete!")
 
     return {
@@ -870,6 +1098,10 @@ def _render_tab_case_overview(results: dict):
     </table>
     """, unsafe_allow_html=True)
 
+    st.markdown("<div style='height: 2rem'></div>", unsafe_allow_html=True)
+    st.divider()
+    _render_tab_extracted_data(results)
+
 
 def _render_tab_extracted_data(results: dict):
     """Tab 2 — Extracted Data."""
@@ -963,31 +1195,39 @@ def _render_tab_tampering(results: dict):
             st.warning("No check results available.")
             continue
         
-        # Render each check's heatmap in a grid
-        cols = st.columns(min(len(checks), 3))
-        for i, check in enumerate(checks):
-            col = cols[i % 3]
-            with col:
-                st.markdown(f"**{check['label']}**")
-                heatmap = check.get("heatmap_b64")
-                if heatmap:
-                    st.image(
-                        f"data:image/png;base64,{heatmap}",
-                        width=300,
-                    )
-                else:
-                    st.caption("No heatmap available.")
-                st.caption(check.get("description", ""))
-                
-                flags = check.get("flags", [])
-                for flag in flags:
-                    sev = flag.get("severity", "low")
-                    if sev == "high":
-                        st.error(f"{_severity_label_md('high')} {flag['message']}")
-                    elif sev == "medium":
-                        st.warning(f"{_severity_label_md('medium')} {flag['message']}")
+        # Render each check with its heatmap on the left and explanation/severity on the right
+        for idx, check in enumerate(checks):
+            with st.container():
+                col_left, col_right = st.columns([1.2, 1.5])
+                with col_left:
+                    heatmap = check.get("heatmap_b64")
+                    if heatmap:
+                        st.image(
+                            f"data:image/png;base64,{heatmap}",
+                            width='stretch',
+                        )
                     else:
-                        st.info(f"{_severity_label_md('low')} {flag['message']}")
+                        st.caption("No heatmap available for this check.")
+                with col_right:
+                    st.markdown(f"#### {check['label']}")
+                    st.markdown(f"**Description:** {check.get('description', '')}")
+                    
+                    flags = check.get("flags", [])
+                    if flags:
+                        st.markdown("**Anomalies Detected:**")
+                        for flag in flags:
+                            sev = flag.get("severity", "low")
+                            if sev == "high":
+                                st.error(f"{_severity_label_md('high')} {flag['message']}")
+                            elif sev == "medium":
+                                st.warning(f"{_severity_label_md('medium')} {flag['message']}")
+                            else:
+                                st.info(f"{_severity_label_md('low')} {flag['message']}")
+                    else:
+                        st.success("✅ No anomalies detected.")
+            
+            if idx < len(checks) - 1:
+                st.divider()
         
         st.divider()
 
@@ -1000,90 +1240,42 @@ def _render_tab_cross_doc_flags(results: dict):
 
     if not cross_doc_flags:
         st.success("No cross-document inconsistencies detected — all documents are consistent.")
-        return
+    else:
+        st.markdown(f"### {len(cross_doc_flags)} Inconsistency Flag(s) Detected")
+        st.markdown("")
 
-    st.markdown(f"### {len(cross_doc_flags)} Inconsistency Flag(s) Detected")
-    st.markdown("")
+        for flag in cross_doc_flags:
+            # Normalise to dict if dataclass
+            if hasattr(flag, "__dataclass_fields__"):
+                flag_dict = asdict(flag)
+            else:
+                flag_dict = flag
 
-    for flag in cross_doc_flags:
-        # Normalise to dict if dataclass
-        if hasattr(flag, "__dataclass_fields__"):
-            flag_dict = asdict(flag)
-        else:
-            flag_dict = flag
+            severity = flag_dict.get("severity", "low")
+            check = flag_dict.get("check", "unknown")
+            message = flag_dict.get("message", "")
+            evidence = flag_dict.get("evidence", {})
+            color = _severity_color(severity)
 
-        severity = flag_dict.get("severity", "low")
-        check = flag_dict.get("check", "unknown")
-        message = flag_dict.get("message", "")
-        evidence = flag_dict.get("evidence", {})
-        color = _severity_color(severity)
+            check_title = check.replace("_", " ").title()
 
-        check_title = check.replace("_", " ").title()
+            with st.expander(
+                f"{_severity_label_md(severity)} {check_title}",
+                expanded=(severity == "high"),
+            ):
+                st.markdown(f"<p style='color: {color}; font-weight: 600;'>{message}</p>",
+                            unsafe_allow_html=True)
 
-        with st.expander(
-            f"{_severity_label_md(severity)} {check_title}",
-            expanded=(severity == "high"),
-        ):
-            st.markdown(f"<p style='color: {color}; font-weight: 600;'>{message}</p>",
-                        unsafe_allow_html=True)
+                if flag_dict.get("similarity") is not None:
+                    st.markdown(f"**Similarity Score:** {flag_dict['similarity']}%")
 
-            if flag_dict.get("similarity") is not None:
-                st.markdown(f"**Similarity Score:** {flag_dict['similarity']}%")
-
-            st.markdown("**Evidence:**")
-            st.json(evidence)
+                st.markdown("**Evidence:**")
+                st.json(evidence)
 
 
-def _render_tab_metadata(results: dict):
-    """Tab 4 — Metadata Analysis."""
-    metadata_results = results["metadata_results"]
 
-    if not metadata_results:
-        st.info("No PDF documents were processed — metadata analysis was skipped.")
-        return
 
-    for meta in metadata_results:
-        st.markdown(f"### {meta['filename']}")
 
-        # Metadata table
-        md = meta.get("metadata", {})
-        meta_rows = ""
-        display_keys = {
-            "creation_date": "Creation Date",
-            "modification_date": "Modification Date",
-            "author": "Author",
-            "producer": "Producer Software",
-            "file_size_kb": "File Size (KB)",
-            "page_count": "Page Count",
-        }
-        for key, label in display_keys.items():
-            val = md.get(key, "—") or "—"
-            meta_rows += f"<tr><td>{label}</td><td>{val}</td></tr>"
-
-        st.markdown(f"""
-        <table class="meta-table">
-            {meta_rows}
-        </table>
-        """, unsafe_allow_html=True)
-
-        st.markdown("<div style='height: 0.75rem'></div>", unsafe_allow_html=True)
-
-        # Flags
-        flags = meta.get("flags", [])
-        if flags:
-            for flag in flags:
-                severity = flag.get("severity", "low")
-                msg = flag.get("message", "")
-                if severity == "high":
-                    st.error(f"{_severity_label_md('high')} {msg}")
-                elif severity == "medium":
-                    st.warning(f"{_severity_label_md('medium')} {msg}")
-                else:
-                    st.info(f"{_severity_label_md('low')} {msg}")
-        else:
-            st.success("No suspicious metadata patterns detected.")
-
-        st.divider()
 
 
 def _render_tab_financial(results: dict):
@@ -1282,6 +1474,17 @@ with st.sidebar:
 
     st.markdown("")
 
+    # API Verification Mode Selector
+    verification_mode = st.selectbox(
+        "API Verification Mode",
+        ["Offline (Local Checksums & Aadhaar QR)", "Online (Surepass Live APIs)"],
+        index=0,
+        help="Online mode validates documents (PAN, GSTIN, DL, etc.) against official government databases using Surepass APIs, requiring SUREPASS_API_KEY. Offline mode uses local mathematical checksums and parses Aadhaar secure QR codes locally."
+    )
+    mode = "online" if "Online" in verification_mode else "offline"
+
+    st.markdown("")
+
     analyze_btn = st.button(
         "Analyze Documents",
         width='stretch',
@@ -1318,7 +1521,7 @@ with st.sidebar:
 
 if analyze_btn and uploaded_files:
     with st.spinner("Processing documents…"):
-        results = _run_pipeline(uploaded_files)
+        results = _run_pipeline(uploaded_files, mode=mode)
         st.session_state["results"] = results
 
 
@@ -1374,30 +1577,156 @@ if "results" not in st.session_state:
     st.stop()
 
 
-# ── Render the 6 tabs ──
+def _render_tab_format_checksums(results: dict):
+    """Tab 7 — Format & Checksums validation."""
+    st.markdown("### Format & Checksum Verification")
+    st.markdown("Validates key document fields using official formats, regular expressions, and mathematical checksums.")
+    st.markdown("")
+
+    documents = results.get("documents", [])
+    has_checksums = False
+
+    for doc in documents:
+        f_res = doc.get("format_checksum")
+        if not f_res:
+            continue
+        
+        has_checksums = True
+        st.markdown(f"#### {doc['filename']} ({doc['document_type'].replace('_', ' ').title()})")
+        
+        details = f_res.get("details", {})
+        if not details:
+            st.info("No formatting checks applicable for this document type.")
+            st.markdown("")
+            continue
+            
+        rows = []
+        for field, check_info in details.items():
+            status = check_info.get("status", "skipped")
+            val = check_info.get("value") or "-"
+            msg = check_info.get("message") or "-"
+            
+            # Map status to colored badge
+            if status == "valid":
+                badge = "🟢 Valid"
+            elif status == "invalid":
+                badge = "🔴 Invalid"
+            else:
+                badge = "⚪ Skipped"
+                
+            rows.append({
+                "Field": field.replace("_", " ").title(),
+                "Extracted Value": val,
+                "Status": badge,
+                "Details": msg
+            })
+            
+        if rows:
+            st.table(rows)
+        st.markdown("")
+
+    if not has_checksums:
+        st.info("No documents with format validation checks were uploaded.")
+
+
+def _render_tab_api_verification(results: dict):
+    """Tab 8 — Government API Verification."""
+    st.markdown("### Identity & Entity API Verification")
+    st.markdown("Cross-verifies document details against government registers (Surepass Online API or Offline QR signature checks).")
+    st.markdown("")
+
+    documents = results.get("documents", [])
+    has_api = False
+
+    for doc in documents:
+        api_res = doc.get("api_verification")
+        if not api_res:
+            continue
+
+        has_api = True
+        st.markdown(f"#### {doc['filename']} ({doc['document_type'].replace('_', ' ').title()})")
+
+        risk = api_res.get("risk", "clean")
+        api_result = api_res.get("api_result", {})
+        
+        if risk == "clean":
+            st.success("Verification Status: Approved & Verified")
+        elif risk == "medium":
+            st.warning("Verification Status: Warning / Discrepancy Found")
+        elif risk == "high":
+            st.error("Verification Status: Verification Failed")
+        else:
+            st.info("Verification Status: Skipped")
+
+        if not api_result or "error" in api_result:
+            err_msg = api_result.get("error", "No verification results available.")
+            st.caption(f"Verification Details: {err_msg.replace('_', ' ').title()}")
+            st.markdown("")
+            continue
+
+        # Aadhaar Card layout
+        if doc["document_type"] == "aadhaar_card":
+            # Display layout columns with photo if present
+            col1, col2 = st.columns([1, 3])
+            with col1:
+                photo_b64 = api_result.get("photo_b64")
+                if photo_b64:
+                    st.markdown(f"""
+                    <div style="border: 2px solid #30363d; border-radius: 6px; padding: 4px; background: #0d1117; display: inline-block;">
+                        <img src="data:image/jpeg;base64,{photo_b64}" style="width: 140px; border-radius: 4px;" />
+                    </div>
+                    """, unsafe_allow_html=True)
+                else:
+                    st.caption("No photo extracted")
+            with col2:
+                st.markdown(f"**Verified Name:** {api_result.get('name') or '-'}")
+                st.markdown(f"**Date of Birth:** {api_result.get('dob') or '-'}")
+                st.markdown(f"**Gender:** {api_result.get('gender') or '-'}")
+                st.markdown(f"**Address:** {api_result.get('address') or '-'}")
+                
+                sig_valid = api_result.get("signature_valid")
+                if sig_valid:
+                    st.markdown("🔑 **Signature Validation:** 🟢 Cryptographically Signed & Verified by UIDAI")
+                elif sig_valid is False:
+                    st.markdown("🔑 **Signature Validation:** 🔴 Cryptographic Signature Verification Failed")
+                else:
+                    st.markdown("🔑 **Signature Validation:** ⚪ Unknown/No Signature")
+
+        else:
+            # Standard government database lookup result (PAN, GSTIN, DL, etc.)
+            st.markdown("**API Response Data:**")
+            st.json(api_result)
+
+        st.markdown("")
+
+    if not has_api:
+        st.info("No documents with API verification checks were processed.")
+
+
+# ── Render the tabs ──
 results = st.session_state["results"]
 
-tab1, tab2, tab3, tab4, tab5, tab6 , tab7 = st.tabs([
-    "Case Overview",
-    "Extracted Data",
-    "Cross-Doc Flags",
-    "Metadata",
-    "Tampering",
-    "Financial",
-    "Recommendation",
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    "Overview",
+    "Format & Checksum Validation",
+    "API Verification",
+    "Cross Document Consistency",
+    "Image Tampering",
+    "Financial Analysis",
+    "Recommendations",
 ])
 
 with tab1:
     _render_tab_case_overview(results)
 
 with tab2:
-    _render_tab_extracted_data(results)
+    _render_tab_format_checksums(results)
 
 with tab3:
-    _render_tab_cross_doc_flags(results)
+    _render_tab_api_verification(results)
 
 with tab4:
-    _render_tab_metadata(results)
+    _render_tab_cross_doc_flags(results)
 
 with tab5:
     _render_tab_tampering(results)

@@ -92,6 +92,7 @@ class OCRResult:
     method: str = "none"
     elapsed_seconds: float = 0.0
     diagnostics: list[str] = field(default_factory=list)
+    word_boxes: list[dict] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -140,9 +141,9 @@ def _load_image_file(image_path: str) -> Image.Image:
     return Image.open(image_path).convert("RGB")
 
 
-def _ocr_single_image(img: Image.Image) -> str:
+def _ocr_single_image(img: Image.Image) -> tuple[str, list[dict]]:
     """
-    Run Surya OCR on a single PIL Image and return the transcribed text.
+    Run Surya OCR on a single PIL Image and return (transcribed_text, word_boxes).
     """
     try:
         predictor = _get_surya_predictor()
@@ -152,16 +153,23 @@ def _ocr_single_image(img: Image.Image) -> str:
 
         # results is a list of PageOCRResult (one per image)
         if not results:
-            return ""
+            return "", []
 
         # Extract text from blocks, stripping any HTML tags
         text_parts = []
+        word_boxes = []
         for block in results[0].blocks:
             if block.html and not block.skipped:
                 cleaned = clean_block_html(block.html)
                 if cleaned:
                     text_parts.append(cleaned)
-        return "\n".join(text_parts)
+                    # Convert bbox: [x0, y0, x1, y1] to [x, y, w, h]
+                    x0, y0, x1, y1 = block.bbox
+                    word_boxes.append({
+                        "text": cleaned,
+                        "box": [int(x0), int(y0), int(x1 - x0), int(y1 - y0)]
+                    })
+        return "\n".join(text_parts), word_boxes
 
     except Exception as exc:
         logger.error("Surya OCR failed: %s", exc)
@@ -170,20 +178,20 @@ def _ocr_single_image(img: Image.Image) -> str:
 
 def _ocr_single_image_with_timeout(
     img: Image.Image, timeout: int = _OCR_PAGE_TIMEOUT_SECONDS
-) -> tuple[str, bool, str]:
+) -> tuple[str, list[dict], bool, str]:
     """
     Run OCR on a single image with a timeout guard.
 
     Returns
     -------
-    tuple[str, bool, str]
-        (extracted_text, succeeded, diagnostic_message)
+    tuple[str, list[dict], bool, str]
+        (extracted_text, word_boxes, succeeded, diagnostic_message)
     """
     with ThreadPoolExecutor(max_workers=1) as executor:
         future = executor.submit(_ocr_single_image, img)
         try:
-            text = future.result(timeout=timeout)
-            return (text, True, "")
+            text, word_boxes = future.result(timeout=timeout)
+            return (text, word_boxes, True, "")
         except FuturesTimeoutError:
             msg = (
                 f"OCR timed out after {timeout}s — the document may be too "
@@ -191,11 +199,11 @@ def _ocr_single_image_with_timeout(
             )
             logger.warning(msg)
             future.cancel()
-            return ("", False, msg)
+            return ("", [], False, msg)
         except Exception as exc:
             msg = f"OCR error: {exc}"
             logger.error(msg)
-            return ("", False, msg)
+            return ("", [], False, msg)
 
 
 # ---------------------------------------------------------------------------
@@ -256,6 +264,7 @@ def extract_text(
     if ext == ".pdf":
         logger.info("Processing PDF (pdfplumber fast-path): %s", path.name)
         plumber_text = ""
+        plumber_words = []
         try:
             with pdfplumber.open(file_path) as pdf:
                 result.pages_total = len(pdf.pages)
@@ -263,6 +272,15 @@ def extract_text(
                     page_text = page.extract_text()
                     if page_text:
                         plumber_text += page_text + "\n"
+                    for w_dict in page.extract_words():
+                        x = int(w_dict['x0'])
+                        y = int(w_dict['top'])
+                        w = int(w_dict['x1'] - w_dict['x0'])
+                        h = int(w_dict['bottom'] - w_dict['top'])
+                        plumber_words.append({
+                            "text": w_dict['text'],
+                            "box": [x, y, w, h]
+                        })
         except Exception as exc:
             logger.warning("pdfplumber failed (%s); will use Surya OCR.", exc)
             result.diagnostics.append(f"pdfplumber extraction failed: {exc}")
@@ -276,6 +294,7 @@ def extract_text(
             result.total_chars = len(plumber_text)
             result.pages_succeeded = result.pages_total
             result.method = "pdfplumber"
+            result.word_boxes = plumber_words
             result.elapsed_seconds = time.monotonic() - start_time
             result.diagnostics.append(
                 f"Text-based PDF — pdfplumber extracted {len(plumber_text)} chars."
@@ -320,12 +339,13 @@ def extract_text(
                 break
 
             logger.info("Running Surya OCR on page %d / %d …", idx + 1, len(images))
-            page_text, succeeded, diag = _ocr_single_image_with_timeout(
+            page_text, page_words, succeeded, diag = _ocr_single_image_with_timeout(
                 img, timeout=page_timeout
             )
 
             if succeeded and page_text:
                 page_texts.append(page_text)
+                result.word_boxes.extend(page_words)
                 result.pages_succeeded += 1
             elif succeeded and not page_text:
                 # OCR ran but extracted nothing (blank page, etc.)
@@ -395,12 +415,13 @@ def extract_text(
             result.diagnostics.append(f"Failed to load image: {exc}")
             return result
 
-        text, succeeded, diag = _ocr_single_image_with_timeout(
+        text, page_words, succeeded, diag = _ocr_single_image_with_timeout(
             img, timeout=page_timeout
         )
 
         result.text = text
         result.total_chars = len(text)
+        result.word_boxes = page_words
         result.elapsed_seconds = time.monotonic() - start_time
 
         if succeeded and text:

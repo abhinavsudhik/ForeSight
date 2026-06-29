@@ -57,9 +57,13 @@ _FLAG_PENALTIES = {
     ("financial_anomaly", "low"):            3,
 
     # Visual Tampering Flags (reduced weightage due to lower accuracy)
-    ("tampering_ela", "high"):               3,
-    ("tampering_ela", "medium"):             1,
-    ("tampering_ela", "low"):                1,
+    ("tampering_halftone", "high"):          3,
+    ("tampering_halftone", "medium"):        1,
+    ("tampering_halftone", "low"):           1,
+
+    ("tampering_font_weight", "high"):       4,
+    ("tampering_font_weight", "medium"):     2,
+    ("tampering_font_weight", "low"):        1,
 
     ("tampering_noise", "high"):             4,
     ("tampering_noise", "medium"):           1,
